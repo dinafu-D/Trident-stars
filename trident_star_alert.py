@@ -273,7 +273,6 @@ def main():
             groups, formed = simulate(chart, events, tf)
             last_price = float(m5["Close"].iloc[-1])
             live_keys = {key for key, _, _ in groups}
-            missed = []
             for key, (f_at, side, g) in sorted(formed.items(), key=lambda kv: kv[1][0]):
                 skey = f"{name}|{tf}|{key}"
                 if skey in state or f_at.date() != now.date():
@@ -284,14 +283,7 @@ def main():
                         sent_any += 1
                 else:
                     state[skey] = now.isoformat()
-                    # broke before any check saw it: report it (any time today), skip a 2-star that became a 3-star
-                    grown = len(g) == 2 and any(k.startswith("3S|" + key[3:] + "|") for k in formed)
-                    if not grown:
-                        missed.append((f_at, side, g))
-            if missed:
-                rows = [f"{'★★★' if len(g) == 3 else '★★☆'} {'highs' if side else 'lows'} @ {g[0]['lvl']:.2f} ({g[0]['anc_tf']}) — formed {f_at:%H:%M}"
-                        for f_at, side, g in missed]
-                send(f"⏱ <b>{name} {tf}</b> — formed and broke between checks (info only):\n" + "\n".join(rows))
+                    # broke before any check saw it -> no message (only live groups are alerted)
             print(f"{name} {tf}: {len(chart)} candles, {sum(len(g) == 3 for _, _, g in groups)} 3-star, {sum(len(g) == 2 for _, _, g in groups)} 2-star live")
     save_state(state)
     print(f"sent {sent_any} alert(s)")

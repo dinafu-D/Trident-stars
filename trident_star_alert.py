@@ -134,7 +134,7 @@ def anchor_tfs(chart_tf):
 
 def simulate(chart, events, chart_tf):
     """Walk the chart candles like TRIDENT does bar by bar.
-    Returns (live groups at the last candle, first-formed time per group key)."""
+    Returns (live groups at the last candle, {group key: (formed time, side, swings)} for every group ever formed)."""
     a_tfs = anchor_tfs(chart_tf)
     piv = {(tf, side): [] for tf in a_tfs for side in (True, False)}
     ev_i = 0
@@ -186,7 +186,9 @@ def simulate(chart, events, chart_tf):
                 else:
                     continue
                 key = f"{len(g)}S|" + ("H" if side else "L") + "|" + "|".join(x["t"].isoformat() for x in g)
-                formed.setdefault(key, bar_end)
+                if key not in formed:
+                    # snapshot, so a group that breaks before the next check can still be reported
+                    formed[key] = (bar_end, side, [dict(x) for x in g])
                 groups.append((key, side, g))
     return groups, formed
 
@@ -223,7 +225,7 @@ def fmt_t(ts):
     return ts.strftime("%d %b %H:%M")
 
 
-def message(name, tf, side, g, formed_at, last_price):
+def message(name, tf, side, g, formed_at, last_price, live=True):
     kind = "SWING HIGHS 🔴" if side else "SWING LOWS 🟢"
     lv = [x["lvl"] for x in g]
     if len(g) == 3:
@@ -237,6 +239,8 @@ def message(name, tf, side, g, formed_at, last_price):
         lines.append(f"Star 3: {lv[2]:.2f}  @ {fmt_t(g[2]['t'])}")
     lines += [f"Zone: {min(lv):.2f} – {max(lv):.2f}",
              f"Formed on candle closing {fmt_t(formed_at)} IST  |  Price ≈ {last_price:.2f}"]
+    if not live:
+        lines.append("⚠️ Already broken before this check (a star was taken) — info only")
     return "\n".join(lines)
 
 
@@ -268,14 +272,26 @@ def main():
             events.sort(key=lambda x: x[0])
             groups, formed = simulate(chart, events, tf)
             last_price = float(m5["Close"].iloc[-1])
-            for key, side, g in groups:
+            live_keys = {key for key, _, _ in groups}
+            missed = []
+            for key, (f_at, side, g) in sorted(formed.items(), key=lambda kv: kv[1][0]):
                 skey = f"{name}|{tf}|{key}"
-                f_at = formed[key]
-                if skey in state or f_at.date() != today:
+                if skey in state or f_at.date() != now.date():
                     continue
-                if send(message(name, tf, side, g, f_at, last_price)):
+                if key in live_keys:
+                    if send(message(name, tf, side, g, f_at, last_price)):
+                        state[skey] = now.isoformat()
+                        sent_any += 1
+                else:
                     state[skey] = now.isoformat()
-                    sent_any += 1
+                    # broke before any check saw it: report it (any time today), skip a 2-star that became a 3-star
+                    grown = len(g) == 2 and any(k.startswith("3S|" + key[3:] + "|") for k in formed)
+                    if not grown:
+                        missed.append((f_at, side, g))
+            if missed:
+                rows = [f"{'★★★' if len(g) == 3 else '★★☆'} {'highs' if side else 'lows'} @ {g[0]['lvl']:.2f} ({g[0]['anc_tf']}) — formed {f_at:%H:%M}"
+                        for f_at, side, g in missed]
+                send(f"⏱ <b>{name} {tf}</b> — formed and broke between checks (info only):\n" + "\n".join(rows))
             print(f"{name} {tf}: {len(chart)} candles, {sum(len(g) == 3 for _, _, g in groups)} 3-star, {sum(len(g) == 2 for _, _, g in groups)} 2-star live")
     save_state(state)
     print(f"sent {sent_any} alert(s)")

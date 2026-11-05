@@ -1,0 +1,56 @@
+name: TRIDENT 3-Star Alert
+
+on:
+  schedule:
+    # times are UTC (IST = UTC + 5:30) -> runs every 5 min, 09:15 to 15:45 IST, Mon-Fri
+    - cron: "45,50,55 3 * * 1-5"
+    - cron: "*/5 4-9 * * 1-5"
+    - cron: "0,5,10,15 10 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Run even outside market hours (1 = yes)"
+        default: "0"
+
+concurrency:
+  group: trident-stars
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      # remembers which groups were already sent, so you never get the same alert twice
+      - name: Restore sent-alert memory
+        uses: actions/cache/restore@v4
+        with:
+          path: state
+          key: star-state-${{ github.run_id }}
+          restore-keys: star-state-
+
+      - name: Check for new 3-star groups
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          CHART_TFS: "5m,15m"
+          SKIP_15M: "1"
+          ALERT_2STAR: "1"
+          FORCE: ${{ github.event.inputs.force || '0' }}
+        run: python trident_star_alert.py
+
+      - name: Save sent-alert memory
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state
+          key: star-state-${{ github.run_id }}

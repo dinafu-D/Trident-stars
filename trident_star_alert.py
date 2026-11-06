@@ -204,21 +204,69 @@ def load_state():
 
 def save_state(state):
     cutoff = (now_ist() - pd.Timedelta(days=10)).isoformat()
-    state = {k: v for k, v in state.items() if v >= cutoff}
+    msgs = {k: v for k, v in state.get("_msgs", {}).items() if v[1] >= cutoff}
+    state = {k: v for k, v in state.items() if not k.startswith("_") and v >= cutoff}
+    state["_msgs"] = msgs
+    state["_last_run"] = now_ist().isoformat()
     os.makedirs(os.path.dirname(STATE_FILE) or ".", exist_ok=True)
     with open(STATE_FILE, "w") as f:
         json.dump(state, f, indent=1)
 
 
 def send(text):
+    """Send a Telegram message. Returns its message id (truthy) or None if it failed."""
     if not TG_TOKEN or not TG_CHAT:
         print("[no Telegram secrets] would send:\n" + text)
-        return True
-    r = requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-                      json={"chat_id": TG_CHAT, "text": text, "parse_mode": "HTML"}, timeout=20)
+        return -1
+    try:
+        r = requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                          json={"chat_id": TG_CHAT, "text": text, "parse_mode": "HTML"}, timeout=20)
+    except Exception as e:
+        print("Telegram error:", e)
+        return None
     if not r.ok:
         print("Telegram error:", r.status_code, r.text)
-    return r.ok
+        return None
+    return r.json()["result"]["message_id"]
+
+
+DELETE_TAKEN = os.getenv("DELETE_TAKEN", "1") == "1"   # delete an alert once its star group is taken
+
+
+def remember_msg(state, skey, mid, text):
+    if DELETE_TAKEN and isinstance(mid, int) and not isinstance(mid, bool) and mid > 0:
+        state.setdefault("_msgs", {})[skey] = [mid, now_ist().isoformat(), text.split("\n")[0]]
+
+
+def delete_msg(mid, head):
+    """Delete a bot message. Telegram only allows deleting within 48 h; older ones are edited to say TAKEN."""
+    if not TG_TOKEN or not TG_CHAT or mid <= 0:
+        print(f"[no Telegram secrets] would delete message {mid}")
+        return True
+    api = f"https://api.telegram.org/bot{TG_TOKEN}"
+    try:
+        r = requests.post(f"{api}/deleteMessage", json={"chat_id": TG_CHAT, "message_id": mid}, timeout=20)
+        if r.ok:
+            return True
+        r = requests.post(f"{api}/editMessageText", timeout=20, json={
+            "chat_id": TG_CHAT, "message_id": mid, "parse_mode": "HTML", "text": f"❌ TAKEN — <s>{head}</s>"})
+        return r.ok or "not found" in r.text or "not modified" in r.text
+    except Exception as e:
+        print("Telegram delete error:", e)
+        return False   # try again next check
+
+
+def delete_taken(state, prefix, live_keys):
+    """Delete sent alerts (for this symbol + timeframe) whose star group is no longer live."""
+    if not DELETE_TAKEN:
+        return 0
+    msgs, n = state.get("_msgs", {}), 0
+    for skey, (mid, _, head) in list(msgs.items()):
+        if skey.startswith(prefix) and skey[len(prefix):] not in live_keys:
+            if delete_msg(mid, head):
+                msgs.pop(skey)
+                n += 1
+    return n
 
 
 def fmt_t(ts):
@@ -226,21 +274,11 @@ def fmt_t(ts):
 
 
 def message(name, tf, side, g, formed_at, last_price, live=True):
-    kind = "SWING HIGHS 🔴" if side else "SWING LOWS 🟢"
-    lv = [x["lvl"] for x in g]
-    if len(g) == 3:
-        head = f"★★★ <b>{name} {tf}</b> — 3-STAR group formed on {kind}"
-    else:
-        head = (f"★★☆ <b>{name} {tf}</b> — 2 stars on {kind}\n"
-                f"Get ready: the next untaken {'swing high' if side else 'swing low'} completes the group")
-    lines = [head, f"Anchor: {lv[0]:.2f}  ({g[0]['anc_tf']} swing)  @ {fmt_t(g[0]['t'])}",
-             f"Star 2: {lv[1]:.2f}  @ {fmt_t(g[1]['t'])}"]
-    if len(g) == 3:
-        lines.append(f"Star 3: {lv[2]:.2f}  @ {fmt_t(g[2]['t'])}")
-    lines += [f"Zone: {min(lv):.2f} – {max(lv):.2f}",
-             f"Formed on candle closing {fmt_t(formed_at)} IST  |  Price ≈ {last_price:.2f}"]
-    if not live:
-        lines.append("⚠️ Already broken before this check (a star was taken) — info only")
+    """🔴 NIFTY 5m ★★★ / ★ (1h) price · date time / ★★ ... / ★★★ ...   (🔴 swing highs, 🟢 swing lows)"""
+    lines = [f"{'🔴' if side else '🟢'} <b>{name} {tf}</b> {'★' * len(g)}",
+             f"★ ({g[0]['anc_tf']}) {g[0]['lvl']:.2f} · {fmt_t(g[0]['t'])}"]
+    for i, x in enumerate(g[1:], start=2):
+        lines.append(f"{'★' * i} {x['lvl']:.2f} · {fmt_t(x['t'])}")
     return "\n".join(lines)
 
 
@@ -278,12 +316,18 @@ def main():
                 if skey in state or f_at.date() != now.date():
                     continue
                 if key in live_keys:
-                    if send(message(name, tf, side, g, f_at, last_price)):
+                    txt = message(name, tf, side, g, f_at, last_price)
+                    mid = send(txt)
+                    if mid:
                         state[skey] = now.isoformat()
+                        remember_msg(state, skey, mid, txt)
                         sent_any += 1
                 else:
                     state[skey] = now.isoformat()
                     # broke before any check saw it -> no message (only live groups are alerted)
+            gone = delete_taken(state, f"{name}|{tf}|", live_keys)
+            if gone:
+                print(f"{name} {tf}: deleted {gone} alert(s) whose group was taken")
             print(f"{name} {tf}: {len(chart)} candles, {sum(len(g) == 3 for _, _, g in groups)} 3-star, {sum(len(g) == 2 for _, _, g in groups)} 2-star live")
     save_state(state)
     print(f"sent {sent_any} alert(s)")

@@ -42,7 +42,7 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          CHART_TFS: "5m,15m"
+          CHART_TFS: "5m,15m,1h"
           SKIP_15M: "1"
           ALERT_2STAR: "1"
           FORCE: ${{ github.event.inputs.force || '0' }}

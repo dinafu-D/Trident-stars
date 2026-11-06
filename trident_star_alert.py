@@ -1,11 +1,12 @@
 """
 TRIDENT 3-Star Alert  ->  Telegram
 ===================================
-Python copy of the TRIDENT V3.45/V3.46 "star group" rule, for NIFTY and SENSEX (index).
+Python copy of the TRIDENT V3.50 "star group" rule, for NIFTY and SENSEX (index),
+on the 5m, 15m, 1h, 4h, 1D, 1W and 1M charts.
 
 Star group (same kind = all swing highs OR all swing lows):
   * anchor  = an UNTAKEN chart swing whose price is EXACTLY a higher-timeframe swing price
-              (1h, then 4h, then 1D; 15m too if SKIP_15M is False; only TFs above the chart TF)
+              5m/15m chart: 1h / 4h / 1D | 1h: 4h / 1D | 4h: 1D | 1D: 1W | 1W: 1M | 1M: 3M
   * group   = anchor + the next 2 untaken chart swings after it on the same side  ->  3 stars
   * a swing is "taken" when price trades through it (high >= swing high / low <= swing low)
   * if star 2 or 3 is taken the group re-forms with the next untaken swings; anchor taken -> group ends
@@ -32,7 +33,7 @@ import yfinance as yf
 # ───────────────────────── SETTINGS ─────────────────────────
 SYMBOLS = {"NIFTY": "^NSEI", "SENSEX": "^BSESN"}
 # chart timeframes to watch (comma list in env CHART_TFS, e.g. "5m,15m")
-CHART_TFS = [t.strip() for t in os.getenv("CHART_TFS", "5m,15m").split(",") if t.strip()]
+CHART_TFS = [t.strip() for t in os.getenv("CHART_TFS", "5m,15m,1h,4h,1D,1W,1M").split(",") if t.strip()]
 SKIP_15M = os.getenv("SKIP_15M", "1") == "1"   # TRIDENT default: ON (only 1h / 4h / 1D start a group)
 PIVOT_LEN = 1                                  # TRIDENT "Swing Left/Right Candles"
 PIV_CAP = 20                                   # TRIDENT swingTFLookback
@@ -46,7 +47,7 @@ STATE_FILE = os.getenv("STATE_FILE", "state/sent_stars.json")
 IST = "Asia/Kolkata"
 SESSION_OPEN = dtime(9, 15)
 SESSION_CLOSE = dtime(15, 30)
-TF_MIN = {"5m": 5, "15m": 15, "1h": 60, "4h": 240, "1D": 1440}
+TF_MIN = {"5m": 5, "15m": 15, "1h": 60, "4h": 240, "1D": 1440, "1W": 10080, "1M": 43200, "3M": 129600}
 
 
 # ───────────────────────── DATA ─────────────────────────
@@ -55,10 +56,10 @@ def now_ist():
 
 
 def fetch(ticker):
-    """5m candles (last ~59 days) + daily candles (1 year), IST, rounded to 2 decimals."""
+    """5m candles (last ~59 days) + daily candles (full history), IST, rounded to 2 decimals."""
     t = yf.Ticker(ticker)
     m5 = t.history(interval="5m", period="59d", auto_adjust=False)
-    d1 = t.history(interval="1d", period="1y", auto_adjust=False)
+    d1 = t.history(interval="1d", period="max", auto_adjust=False)
     if m5.empty:
         raise RuntimeError(f"no 5m data for {ticker}")
     m5 = m5.tz_convert(IST)[["High", "Low", "Close"]].dropna().round(2)
@@ -66,6 +67,15 @@ def fetch(ticker):
     d1 = d1[["High", "Low"]].dropna().round(2)
     d1.index = pd.to_datetime(d1.index.date)
     return m5, d1
+
+
+def fetch_hourly(ticker):
+    """1h candles, ~2 years (for the 1h / 4h charts)."""
+    h = yf.Ticker(ticker).history(interval="60m", period="729d", auto_adjust=False)
+    if h.empty:
+        raise RuntimeError(f"no 1h data for {ticker}")
+    h = h.tz_convert(IST)[["High", "Low", "Close"]].dropna().round(2)
+    return h[(h.index.time >= SESSION_OPEN) & (h.index.time < SESSION_CLOSE)]
 
 
 def session_close_of(ts):
@@ -86,6 +96,8 @@ def build_bars(m5, tf, now):
         day = df.index.normalize()
         second = df.index.time >= dtime(13, 15)
         key = day + pd.to_timedelta(["13h15min" if s else "9h15min" for s in second])
+    elif tf == "1D":
+        key = df.index.normalize() + pd.Timedelta(hours=9, minutes=15)
     else:
         raise ValueError(tf)
     g = df.groupby(key).agg(high=("High", "max"), low=("Low", "min"))
@@ -105,6 +117,39 @@ def build_daily(d1, now):
 
 
 # ───────────────────────── TRIDENT LOGIC ─────────────────────────
+def build_period(d1, tf, now):
+    """1D / 1W / 1M / 3M candles from daily data (TradingView NSE: week = Mon-Fri, calendar month / quarter).
+    A candle counts once its period is over (end = last day of the period, 15:30 IST)."""
+    d = d1.copy()
+    dates = pd.DatetimeIndex(d.index)
+    if tf == "1D":
+        key = dates
+    elif tf == "1W":
+        key = dates - pd.to_timedelta(dates.weekday, unit="D")
+    elif tf == "1M":
+        key = dates.to_period("M").to_timestamp()
+    elif tf == "3M":
+        key = dates.to_period("Q").to_timestamp()
+    else:
+        raise ValueError(tf)
+    g = d.groupby(key).agg(high=("High", "max"), low=("Low", "min"))
+    starts = pd.DatetimeIndex(g.index)
+    if tf == "1D":
+        ends = starts
+    elif tf == "1W":
+        ends = starts + pd.Timedelta(days=4)
+    elif tf == "1M":
+        ends = starts + pd.offsets.MonthEnd(0)
+    else:
+        ends = starts + pd.offsets.QuarterEnd(0)
+    out = pd.DataFrame({
+        "start": (starts + pd.Timedelta(hours=9, minutes=15)).tz_localize(IST),
+        "end": (ends + pd.Timedelta(hours=15, minutes=30)).tz_localize(IST),
+        "high": g["high"].values, "low": g["low"].values})
+    out = out[out["end"] <= now]
+    return out.reset_index(drop=True)
+
+
 def htf_pivot_events(bars, tf):
     """TRIDENT f_pivotHTF: bar j-1 is a pivot high if high[j-1] > high[j-2] and > high[j];
     known when bar j closes. Returns list of (known_time, tf, is_high, price)."""
@@ -128,6 +173,14 @@ def push_piv(arr, v):
 
 
 def anchor_tfs(chart_tf):
+    """Which higher-timeframe swings can start a group (TRIDENT V3.50):
+    below 1D -> 1h / 4h / 1D (15m too if not skipped) | 1D -> 1W | 1W -> 1M | 1M -> 3M"""
+    if chart_tf == "1D":
+        return ["1W"]
+    if chart_tf == "1W":
+        return ["1M"]
+    if chart_tf == "1M":
+        return ["3M"]
     order = (["15m"] if not SKIP_15M else []) + ["1h", "4h", "1D"]
     return [t for t in order if TF_MIN[t] > TF_MIN[chart_tf]]
 
@@ -275,10 +328,13 @@ def fmt_t(ts):
 
 def message(name, tf, side, g, formed_at, last_price, live=True):
     """🔴 NIFTY 5m ★★★ / ★ (1h) price · date time / ★★ ... / ★★★ ...   (🔴 swing highs, 🟢 swing lows)"""
+    ft = (lambda t: t.strftime("%d %b %Y")) if tf in ("1D", "1W", "1M") else fmt_t
     lines = [f"{'🔴' if side else '🟢'} <b>{name} {tf}</b> {'★' * len(g)}",
-             f"★ ({g[0]['anc_tf']}) {g[0]['lvl']:.2f} · {fmt_t(g[0]['t'])}"]
+             f"★ ({g[0]['anc_tf']}) {g[0]['lvl']:.2f} · {ft(g[0]['t'])}"]
     for i, x in enumerate(g[1:], start=2):
-        lines.append(f"{'★' * i} {x['lvl']:.2f} · {fmt_t(x['t'])}")
+        prev = g[i - 2]["lvl"]
+        pct = abs(x["lvl"] - prev) / prev * 100          # gap from the previous star
+        lines.append(f"{'★' * i} {x['lvl']:.2f} · {ft(x['t'])}   ({pct:.2f}%)")
     return "\n".join(lines)
 
 
@@ -298,10 +354,30 @@ def main():
         except Exception as e:
             print(f"{name}: data error {e}")
             continue
-        htf = {"15m": build_bars(m5, "15m", now), "1h": build_bars(m5, "1h", now),
-               "4h": build_bars(m5, "4h", now), "1D": build_daily(d1, now)}
+        h1 = None
+        if any(t in ("1h", "4h") for t in CHART_TFS):
+            try:
+                h1 = fetch_hourly(ticker)
+            except Exception as e:
+                print(f"{name}: 1h data error {e}")
+        intraday_htf = {"15m": build_bars(m5, "15m", now), "1h": build_bars(m5, "1h", now),
+                        "4h": build_bars(m5, "4h", now), "1D": build_daily(d1, now)}
         for tf in CHART_TFS:
-            chart = build_bars(m5, tf, now)
+            # each chart timeframe uses one data source for chart + HTF swings, so prices match exactly
+            if tf in ("5m", "15m"):
+                chart, htf = build_bars(m5, tf, now), intraday_htf
+            elif tf in ("1h", "4h"):
+                if h1 is None:
+                    continue
+                chart = build_bars(h1, tf, now)
+                htf = {"4h": build_bars(h1, "4h", now), "1D": build_bars(h1, "1D", now)}
+            elif tf in ("1D", "1W", "1M"):
+                chart = build_period(d1, tf, now)
+                htf = {"1W": build_period(d1, "1W", now), "1M": build_period(d1, "1M", now),
+                       "3M": build_period(d1, "3M", now)}
+            else:
+                print(f"unknown timeframe {tf}")
+                continue
             if len(chart) < 5:
                 continue
             events = []
@@ -313,7 +389,9 @@ def main():
             live_keys = {key for key, _, _ in groups}
             for key, (f_at, side, g) in sorted(formed.items(), key=lambda kv: kv[1][0]):
                 skey = f"{name}|{tf}|{key}"
-                if skey in state or f_at.date() != now.date():
+                # 5m-4h: formed today | 1D/1W/1M: formed in the last 4 days (a month can end on a weekend)
+                recent = f_at.date() == now.date() if tf not in ("1D", "1W", "1M") else (now - f_at) <= pd.Timedelta(days=4)
+                if skey in state or not recent:
                     continue
                 if key in live_keys:
                     txt = message(name, tf, side, g, f_at, last_price)

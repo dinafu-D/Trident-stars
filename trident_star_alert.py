@@ -30,6 +30,11 @@ import pandas as pd
 import requests
 import yfinance as yf
 
+try:
+    import dhan_data            # Dhan Data API (used when the DHAN_* secrets are set)
+except ImportError:             # other bots (Global stars / laptop) don't have this file
+    dhan_data = None
+
 # ───────────────────────── SETTINGS ─────────────────────────
 SYMBOLS = {"NIFTY": "^NSEI", "SENSEX": "^BSESN"}
 # chart timeframes to watch (comma list in env CHART_TFS, e.g. "5m,15m")
@@ -349,17 +354,24 @@ def main():
     today = now.date()
     sent_any = 0
     for name, ticker in SYMBOLS.items():
+        want_h1 = any(t in ("1h", "4h") for t in CHART_TFS)
+        h1, src = None, "Yahoo"
         try:
-            m5, d1 = fetch(ticker)
+            if not (dhan_data and dhan_data.enabled()):
+                raise RuntimeError("Dhan secrets not set")
+            m5, d1, h1 = dhan_data.fetch(name, now, want_h1)
+            src = "Dhan"
         except Exception as e:
-            print(f"{name}: data error {e}")
-            continue
-        h1 = None
-        if any(t in ("1h", "4h") for t in CHART_TFS):
+            if dhan_data and dhan_data.enabled():
+                print(f"{name}: Dhan data error ({e}) -> using Yahoo")
             try:
-                h1 = fetch_hourly(ticker)
-            except Exception as e:
-                print(f"{name}: 1h data error {e}")
+                m5, d1 = fetch(ticker)
+                if want_h1:
+                    h1 = fetch_hourly(ticker)
+            except Exception as e2:
+                print(f"{name}: data error {e2}")
+                continue
+        print(f"{name}: data from {src}, last 5m candle {m5.index[-1]:%d %b %H:%M}")
         intraday_htf = {"15m": build_bars(m5, "15m", now), "1h": build_bars(m5, "1h", now),
                         "4h": build_bars(m5, "4h", now), "1D": build_daily(d1, now)}
         for tf in CHART_TFS:

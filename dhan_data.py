@@ -67,12 +67,18 @@ def _new_token():
     last = None
     for attempt in range(2):
         code = pyotp.TOTP(TOTP_SECRET).now()
-        r = requests.post(AUTH, params={"dhanClientId": CLIENT_ID, "pin": PIN, "totp": code}, timeout=30)
+        try:
+            r = requests.post(AUTH, params={"dhanClientId": CLIENT_ID, "pin": PIN, "totp": code}, timeout=30)
+        except Exception as e:
+            # never print the error itself: it can contain the request address, which includes the PIN
+            raise RuntimeError(f"Dhan login request failed ({type(e).__name__})") from None
         try:
             j = r.json()
         except Exception:
-            j = {"raw": r.text[:200]}
+            j = {"http": r.status_code}
         tok = j.get("accessToken") if isinstance(j, dict) else None
+        if isinstance(j, dict):                                   # keep only harmless fields in logs
+            j = {k: v for k, v in j.items() if k in ("errorType", "errorCode", "errorMessage", "status", "message", "http")}
         if tok:
             _save_token(tok, time.time() + 23 * 3600)     # valid 24 h; renew 1 h early
             print("Dhan: new access token generated")

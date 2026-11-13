@@ -18,7 +18,7 @@ HTF pivot history = last 20 pivots per timeframe, exact price match (tolerance 0
 Alerts (each sent once, only if it formed today and is still live):
   * 2 stars  = anchor + 1 untaken swing after it  -> heads-up, the next swing on that side completes the group
   * 3 stars  = complete group
-Data: Yahoo Finance via yfinance (free). Candles are rebuilt from 5m data so prices match exactly.
+Data: Dhan Data API (dhan_data.py). Candles are rebuilt from 5m data so prices match exactly.
 """
 
 import json
@@ -28,7 +28,6 @@ from datetime import datetime, time as dtime, timedelta
 
 import pandas as pd
 import requests
-import yfinance as yf
 
 try:
     import dhan_data            # Dhan Data API (used when the DHAN_* secrets are set)
@@ -62,6 +61,7 @@ def now_ist():
 
 def fetch(ticker):
     """5m candles (last ~59 days) + daily candles (full history), IST, rounded to 2 decimals."""
+    import yfinance as yf      # only used by the laptop 1m script
     t = yf.Ticker(ticker)
     m5 = t.history(interval="5m", period="59d", auto_adjust=False)
     d1 = t.history(interval="1d", period="max", auto_adjust=False)
@@ -76,6 +76,7 @@ def fetch(ticker):
 
 def fetch_hourly(ticker):
     """1h candles, ~2 years (for the 1h / 4h charts)."""
+    import yfinance as yf
     h = yf.Ticker(ticker).history(interval="60m", period="729d", auto_adjust=False)
     if h.empty:
         raise RuntimeError(f"no 1h data for {ticker}")
@@ -263,8 +264,11 @@ def load_state():
 def save_state(state):
     cutoff = (now_ist() - pd.Timedelta(days=10)).isoformat()
     msgs = {k: v for k, v in state.get("_msgs", {}).items() if v[1] >= cutoff}
+    warn = state.get("_dhan_warn")
     state = {k: v for k, v in state.items() if not k.startswith("_") and v >= cutoff}
     state["_msgs"] = msgs
+    if warn:
+        state["_dhan_warn"] = warn
     state["_last_run"] = now_ist().isoformat()
     os.makedirs(os.path.dirname(STATE_FILE) or ".", exist_ok=True)
     with open(STATE_FILE, "w") as f:
@@ -353,24 +357,18 @@ def main():
     state = load_state()
     today = now.date()
     sent_any = 0
+    data_errors = []
     for name, ticker in SYMBOLS.items():
         want_h1 = any(t in ("1h", "4h") for t in CHART_TFS)
-        h1, src = None, "Yahoo"
+        src = "Dhan"
         try:
             if not (dhan_data and dhan_data.enabled()):
-                raise RuntimeError("Dhan secrets not set")
+                raise RuntimeError("Dhan secrets DHAN_CLIENT_ID / DHAN_PIN / DHAN_TOTP_SECRET not set")
             m5, d1, h1 = dhan_data.fetch(name, now, want_h1)
-            src = "Dhan"
         except Exception as e:
-            if dhan_data and dhan_data.enabled():
-                print(f"{name}: Dhan data error ({e}) -> using Yahoo")
-            try:
-                m5, d1 = fetch(ticker)
-                if want_h1:
-                    h1 = fetch_hourly(ticker)
-            except Exception as e2:
-                print(f"{name}: data error {e2}")
-                continue
+            print(f"{name}: Dhan data error {e}")
+            data_errors.append(f"{name}: {str(e)[:150]}")
+            continue
         print(f"{name}: data from {src}, last 5m candle {m5.index[-1]:%d %b %H:%M}")
         intraday_htf = {"15m": build_bars(m5, "15m", now), "1h": build_bars(m5, "1h", now),
                         "4h": build_bars(m5, "4h", now), "1D": build_daily(d1, now)}
@@ -419,6 +417,12 @@ def main():
             if gone:
                 print(f"{name} {tf}: deleted {gone} alert(s) whose group was taken")
             print(f"{name} {tf}: {len(chart)} candles, {sum(len(g) == 3 for _, _, g in groups)} 3-star, {sum(len(g) == 2 for _, _, g in groups)} 2-star live")
+    if data_errors:
+        # tell you on Telegram, at most once an hour, so a Dhan problem never goes unnoticed
+        last = state.get("_dhan_warn", "")
+        if not last or now - pd.Timestamp(last) > pd.Timedelta(hours=1):
+            send("⚠️ Star bot: could not get Dhan data\n" + "\n".join(data_errors))
+            state["_dhan_warn"] = now.isoformat()
     save_state(state)
     print(f"sent {sent_any} alert(s)")
     return 0

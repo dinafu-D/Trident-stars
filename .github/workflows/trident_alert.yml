@@ -25,6 +25,8 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           DHAN_ACCESS_TOKEN: ${{ secrets.DHAN_ACCESS_TOKEN }}
           DHAN_CLIENT_ID: ${{ secrets.DHAN_CLIENT_ID }}
+          FORCE: "1"
+          SYMBOLS: "NIFTY"
         run: python trident_alert.py
       - name: Save state
         run: |

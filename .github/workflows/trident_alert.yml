@@ -1,8 +1,6 @@
 name: TRIDENT alert
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "*/5 3-10 * * 1-5"      # every 5 min, 08:30-16:00 IST on weekdays (the script itself stops outside 09:15-15:45)
 concurrency:
   group: trident-alert
   cancel-in-progress: false
@@ -19,14 +17,21 @@ jobs:
           python-version: "3.11"
           cache: pip
       - run: pip install -r requirements.txt
+      - name: Today's date (IST)
+        id: d
+        run: echo "day=$(TZ=Asia/Kolkata date +%F)" >> "$GITHUB_OUTPUT"
+      - name: Keep today's Dhan token between runs
+        uses: actions/cache@v4
+        with:
+          path: .cache
+          key: dhan-token-${{ steps.d.outputs.day }}
       - name: Run bot
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          DHAN_ACCESS_TOKEN: ${{ secrets.DHAN_ACCESS_TOKEN }}
           DHAN_CLIENT_ID: ${{ secrets.DHAN_CLIENT_ID }}
-          FORCE: "1"
-          SYMBOLS: "NIFTY"
+          DHAN_PIN: ${{ secrets.DHAN_PIN }}
+          DHAN_TOTP_SECRET: ${{ secrets.DHAN_TOTP_SECRET }}
         run: python trident_alert.py
       - name: Save state
         run: |

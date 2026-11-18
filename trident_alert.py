@@ -20,6 +20,10 @@ THREE kinds of reminder
      Label = "Dark EOB" or "Dark Sweep EOB" + green / red
 
 Each alert is sent once (state/sent_stars.json).  Only candles that CLOSED today are alerted.
+
+STATUS MESSAGES (V3.57.1): so a quiet day is never a mystery
+  * "✅ TRIDENT bot running" once a day, on the first run after 09:15 that loaded the data (STATUS_MSG=0 turns it off).
+  * "⚠️ TRIDENT bot problem" when the Dhan login or the data fails (each problem once a day).
 """
 import json
 import os
@@ -41,6 +45,9 @@ BOX_TFS = [t.strip() for t in os.getenv("BOX_TFS", "1h,4h,1D").split(",") if t.s
 EOB_ON = os.getenv("EOB_ON", "1") == "1"
 ALERT_2STAR = os.getenv("ALERT_2STAR", "0") == "1"      # default OFF: only complete 3-star groups are sent
 DELETE_TAKEN = os.getenv("DELETE_TAKEN", "1") == "1"
+STATUS_MSG = os.getenv("STATUS_MSG", "1") == "1"          # daily "bot running" message + problem messages
+PROBLEMS = []                                              # filled during a run, sent to Telegram once a day each
+TOKEN_NOTE = ""
 # a box gets a label (and an alert) once it lasted this many candles of ITS OWN timeframe (TRIDENT: 1h = 9, 4h / 1D = every box)
 BOX_MIN_BARS = {"1h": int(os.getenv("BOX_MIN_BARS_1H", "9")), "4h": int(os.getenv("BOX_MIN_BARS_4H", "1")),
                 "1D": int(os.getenv("BOX_MIN_BARS_1D", "1"))}
@@ -60,6 +67,9 @@ TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
 DHAN_TOKEN = os.getenv("DHAN_ACCESS_TOKEN", "")
 DHAN_CLIENT = os.getenv("DHAN_CLIENT_ID", "")
 STATE_FILE = os.getenv("STATE_FILE", "state/sent_stars.json")
+DHAN_PIN = os.getenv("DHAN_PIN", "")                    # optional: with DHAN_TOTP_SECRET the bot makes its own daily token
+DHAN_TOTP_SECRET = os.getenv("DHAN_TOTP_SECRET", "")
+TOKEN_FILE = os.getenv("TOKEN_FILE", ".cache/dhan_token.json")
 LOCAL_DIR = os.getenv("LOCAL_DIR", "")            # test only: read <SYMBOL>_5m/15m/60m.parquet from this folder
 
 IST = "Asia/Kolkata"
@@ -75,6 +85,55 @@ def now_ist():
 
 
 # ───────────────────────── DATA (Dhan) ─────────────────────────
+def _totp(secret):
+    """6-digit authenticator code (RFC 6238), no extra package needed."""
+    import base64, hashlib, hmac, struct
+    sec = "".join(ch for ch in secret.upper() if ch not in " -\"'=")
+    key = base64.b32decode(sec + "=" * (-len(sec) % 8))
+    h = hmac.new(key, struct.pack(">Q", int(_time.time() // 30)), hashlib.sha1).digest()
+    o = h[-1] & 15
+    return f"{(struct.unpack('>I', h[o:o + 4])[0] & 0x7fffffff) % 1000000:06d}"
+
+
+def ensure_token():
+    """Use a saved token (< 20 h old) or make a new one with PIN + TOTP. Falls back to the DHAN_ACCESS_TOKEN secret."""
+    global DHAN_TOKEN, TOKEN_NOTE
+    if not (DHAN_PIN and DHAN_TOTP_SECRET and DHAN_CLIENT):
+        TOKEN_NOTE = "using the DHAN_ACCESS_TOKEN secret (no auto token: DHAN_PIN / DHAN_TOTP_SECRET missing)"
+        return
+    try:
+        with open(TOKEN_FILE) as f:
+            j = json.load(f)
+        if _time.time() - j["t"] < 20 * 3600 and j.get("token"):
+            DHAN_TOKEN = j["token"]
+            TOKEN_NOTE = "auto token OK (saved today)"
+            print("Dhan token: reused saved token")
+            return
+    except Exception:
+        pass
+    try:
+        r = requests.post("https://auth.dhan.co/app/generateAccessToken",
+                          params={"dhanClientId": DHAN_CLIENT, "pin": DHAN_PIN, "totp": _totp(DHAN_TOTP_SECRET)}, timeout=30)
+        js = r.json() if r.content else {}
+        tok = js.get("accessToken") or js.get("access_token") or js.get("token")
+        if not r.ok or not tok:
+            print(f"Dhan token: could not generate (HTTP {r.status_code}) {str(js)[:200]}")
+            msg = js.get("message") or js.get("errorMessage") or js.get("remarks") or js.get("status") or ""
+            PROBLEMS.append(f"Dhan auto login failed (HTTP {r.status_code}) {str(msg)[:120]}. Check DHAN_PIN and DHAN_TOTP_SECRET in GitHub secrets.")
+            TOKEN_NOTE = "auto token FAILED - using the DHAN_ACCESS_TOKEN secret"
+            return
+        DHAN_TOKEN = tok
+        os.makedirs(os.path.dirname(TOKEN_FILE) or ".", exist_ok=True)
+        with open(TOKEN_FILE, "w") as f:
+            json.dump({"t": _time.time(), "token": tok}, f)
+        print("Dhan token: made a new one")
+        TOKEN_NOTE = "auto token OK (new token made today)"
+    except Exception as e:
+        print("Dhan token error:", e)
+        PROBLEMS.append(f"Dhan auto login error: {str(e)[:150]}")
+        TOKEN_NOTE = "auto token FAILED - using the DHAN_ACCESS_TOKEN secret"
+
+
 def _dhan_chunk(sec_id, interval, start, end):
     body = {"securityId": str(sec_id), "exchangeSegment": "IDX_I", "instrument": "INDEX", "interval": interval,
             "oi": False, "fromDate": start.strftime("%Y-%m-%d 00:00:00"), "toDate": end.strftime("%Y-%m-%d 23:59:59")}
@@ -101,7 +160,7 @@ def _session_only(df):
     return df[(t >= SESSION_OPEN) & (t < SESSION_CLOSE)]
 
 
-def fetch(name, interval_min, days):
+def fetch_dhan(name, interval_min, days):
     """Candles for one index. Returns DataFrame indexed by candle START time (IST): open high low close."""
     if LOCAL_DIR:
         p = os.path.join(LOCAL_DIR, f"{name}_{interval_min}m.parquet")
@@ -131,6 +190,16 @@ def fetch(name, interval_min, days):
     return _session_only(d)
 
 
+def fetch(name, interval_min, days):
+    try:
+        return fetch_dhan(name, interval_min, days)
+    except Exception as e:
+        if not (YAHOO_BACKUP and not LOCAL_DIR):
+            raise
+        print(f"{name} {interval_min}m: Dhan failed ({e}); using Yahoo backup")
+        return fetch_yahoo(name, interval_min, days)
+
+
 def fetch_daily(name, m60, days):
     """Daily candles (index = date) for the 1D / 1W / 1M star charts. Dhan daily endpoint; if it fails, built from 60m."""
     if not LOCAL_DIR:
@@ -149,6 +218,16 @@ def fetch_daily(name, m60, days):
             print(f"{name}: daily endpoint gave nothing usable (HTTP {r.status_code}); using daily built from 60m")
         except Exception as e:
             print(f"{name}: daily endpoint error {e}; using daily built from 60m")
+    if YAHOO_BACKUP and not LOCAL_DIR:
+        try:
+            import yfinance as yf
+            y = yf.Ticker(YF[name]).history(interval="1d", period="max", auto_adjust=False)
+            y = y.rename(columns=str.lower)[["high", "low"]].dropna().round(2)
+            y.index = pd.to_datetime(y.index.date)
+            if len(y) > 100:
+                return y
+        except Exception as e:
+            print(f"{name}: Yahoo daily error {e}")
     g = m60.groupby(m60.index.normalize().tz_localize(None)).agg(high=("high", "max"), low=("low", "min"))
     return g
 
@@ -172,6 +251,20 @@ def build_period(d1, tf, now):
                        index=(starts + pd.Timedelta(hours=9, minutes=15)).tz_localize(IST))
     out.index.name = "start"
     return out[out["end"] <= now]
+
+
+YF = {"NIFTY": "^NSEI", "SENSEX": "^BSESN"}
+YAHOO_BACKUP = os.getenv("YAHOO_BACKUP", "1") == "1"        # use Yahoo only if Dhan fails
+
+
+def fetch_yahoo(name, interval_min, days):
+    import yfinance as yf
+    iv, per = {5: ("5m", "59d"), 15: ("15m", "59d"), 60: ("60m", "729d")}[interval_min]
+    d = yf.Ticker(YF[name]).history(interval=iv, period=per, auto_adjust=False)
+    if d.empty:
+        raise RuntimeError(f"Yahoo: no {iv} data for {name}")
+    d = d.tz_convert(IST).rename(columns=str.lower)[["open", "high", "low", "close"]].dropna().round(2)
+    return _session_only(d)
 
 
 def session_close_of(ts):
@@ -573,11 +666,16 @@ def load_state():
         return {}
 
 
+STATUS_KEEP = {}
+
+
 def save_state(state):
     cutoff = (now_ist() - pd.Timedelta(days=10)).isoformat()
     msgs = {k: v for k, v in state.get("_msgs", {}).items() if v[1] >= cutoff}
     state = {k: v for k, v in state.items() if not k.startswith("_") and v >= cutoff}
     state["_msgs"] = msgs
+    if isinstance(state_status := STATUS_KEEP.get("v"), dict):
+        state["_status"] = state_status
     state["_last_run"] = now_ist().isoformat()
     os.makedirs(os.path.dirname(STATE_FILE) or ".", exist_ok=True)
     with open(STATE_FILE, "w") as f:
@@ -697,6 +795,7 @@ def run_symbol(name, now, state):
             print(f"{name} {tf} stars: {len(chart)} candles, {sum(len(g) == 3 for _, _, g in groups)} 3-star, {sum(len(g) == 2 for _, _, g in groups)} 2-star live")
         except Exception as e:
             print(f"{name} {tf} stars: error {e}")
+            PROBLEMS.append(f"{name} {tf} stars: error {e}"[:200])
 
     # ---- 2) box breaks ----
     for tf in BOX_TFS:
@@ -720,6 +819,7 @@ def run_symbol(name, now, state):
             print(f"{name} {tf} boxes: {len(c)} candles, {n_today} break(s) today")
         except Exception as e:
             print(f"{name} {tf} boxes: error {e}")
+            PROBLEMS.append(f"{name} {tf} boxes: error {e}"[:200])
 
     # ---- 3) dark EOB on 15m ----
     if EOB_ON:
@@ -739,6 +839,7 @@ def run_symbol(name, now, state):
             print(f"{name} 15m EOB: {len(c)} candles, {n_today} dark EOB(s) today")
         except Exception as e:
             print(f"{name} 15m EOB: error {e}")
+            PROBLEMS.append(f"{name} 15m EOB: error {e}"[:200])
     return sent
 
 
@@ -748,19 +849,52 @@ def main():
     if not force and (now.weekday() >= 5 or not (dtime(9, 15) <= now.time() <= dtime(15, 45))):
         print("outside market hours, exit")
         return 0
-    if not LOCAL_DIR and not (DHAN_TOKEN and DHAN_CLIENT):
-        print("DHAN_ACCESS_TOKEN / DHAN_CLIENT_ID missing")
-        return 1
+    if not LOCAL_DIR:
+        ensure_token()
     state = load_state()
-    sent = 0
+    st = state.get("_status") if isinstance(state.get("_status"), dict) else {}
+    day = now.strftime("%Y-%m-%d")
+    if st.get("day") != day:
+        st = {"day": day, "hello": False, "told": []}
+    STATUS_KEEP["v"] = st
+    if not LOCAL_DIR and not (DHAN_TOKEN and DHAN_CLIENT):
+        print("Dhan login missing" + (" - using Yahoo backup" if YAHOO_BACKUP else ""))
+        PROBLEMS.append("Dhan login missing: DHAN_CLIENT_ID or a token is not set in GitHub secrets.")
+        if not YAHOO_BACKUP:
+            report(st, ok=[])
+            save_state(state)
+            return 1
+    sent, ok = 0, []
     for name in SYMBOLS:
         try:
             sent += run_symbol(name, now, state)
+            ok.append(name)
         except Exception as e:
             print(f"{name}: data error {e}")
+            PROBLEMS.append(f"{name}: no data - {str(e)[:160]}")
+    report(st, ok)
     save_state(state)
     print(f"sent {sent} alert(s)")
     return 0
+
+
+def report(st, ok):
+    """Telegram status: problems (each once a day) and one 'bot running' message a day after the data loaded."""
+    if not STATUS_MSG:
+        return
+    new = [p for p in dict.fromkeys(PROBLEMS) if p[:60] not in st["told"]]
+    if new:
+        txt = "⚠️ <b>TRIDENT bot problem</b>\n" + "\n".join("• " + p.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;") for p in new[:5])
+        if send(txt) is not None:
+            st["told"] += [p[:60] for p in new]
+    if not st.get("hello") and ok and not PROBLEMS:
+        now = now_ist()
+        txt = (f"✅ <b>TRIDENT bot running</b> · {now:%d %b %H:%M} IST\n"
+               f"Dhan: {TOKEN_NOTE or 'login OK'}\nData OK: {', '.join(ok)}\n"
+               f"Watching: 3-star groups {','.join(STAR_TFS)} · box breaks {','.join(BOX_TFS) or 'off'} · dark EOB 15m {'on' if EOB_ON else 'off'}\n"
+               "Alerts come only when something forms - a quiet day is normal.")
+        if send(txt) is not None:
+            st["hello"] = True
 
 
 if __name__ == "__main__":

@@ -16,12 +16,15 @@ THREE kinds of reminder
      * When a group is taken (price trades through it) its Telegram message is deleted.
 2) BOX BREAK: a consolidation box on the 1h, 4h or 1D chart broke UP (U) or DOWN (D) on a closed candle.
      Label = how long the box lasted:  "3d", "1.5h", "45m" (1D chart: number of daily candles)
-3) DARK EOB on 15m: a dark EOB (FVG follows) or a dark SWEEP EOB just formed.
-     Label = "Dark EOB" or "Dark Sweep EOB" + green / red
+3) EOB on 15m:  "Sweep EOB" when a sweep EOB (blue / orange box) forms,
+                "Dark EOB" / "Dark Sweep EOB" when an EOB turns dark (FVG follows). + green / red.
+   Message = swing price + time and the candle it formed / turned dark on.
+
+DATA: Dhan first. If Dhan fails (login, token limit, outage) the same run uses Yahoo data, so alerts keep coming.
 
 Each alert is sent once (state/sent_stars.json).  Only candles that CLOSED today are alerted.
 
-STATUS MESSAGES (V3.57.1): so a quiet day is never a mystery
+STATUS MESSAGES (V3.57.2): so a quiet day is never a mystery
   * "✅ TRIDENT bot running" once a day, on the first run after 09:15 that loaded the data (STATUS_MSG=0 turns it off).
   * "⚠️ TRIDENT bot problem" when the Dhan login or the data fails (each problem once a day).
 """
@@ -46,6 +49,9 @@ EOB_ON = os.getenv("EOB_ON", "1") == "1"
 ALERT_2STAR = os.getenv("ALERT_2STAR", "0") == "1"      # default OFF: only complete 3-star groups are sent
 DELETE_TAKEN = os.getenv("DELETE_TAKEN", "1") == "1"
 STATUS_MSG = os.getenv("STATUS_MSG", "1") == "1"          # daily "bot running" message + problem messages
+SWEEP_EOB = os.getenv("SWEEP_EOB", "1") == "1"            # alert when a sweep EOB forms (15m)
+SRC = {}                                                   # data source used per index this run (Dhan / Yahoo)
+REFRESHED = False
 PROBLEMS = []                                              # filled during a run, sent to Telegram once a day each
 TOKEN_NOTE = ""
 # a box gets a label (and an alert) once it lasted this many candles of ITS OWN timeframe (TRIDENT: 1h = 9, 4h / 1D = every box)
@@ -95,12 +101,17 @@ def _totp(secret):
     return f"{(struct.unpack('>I', h[o:o + 4])[0] & 0x7fffffff) % 1000000:06d}"
 
 
-def ensure_token():
+def ensure_token(force=False):
     """Use a saved token (< 20 h old) or make a new one with PIN + TOTP. Falls back to the DHAN_ACCESS_TOKEN secret."""
     global DHAN_TOKEN, TOKEN_NOTE
     if not (DHAN_PIN and DHAN_TOTP_SECRET and DHAN_CLIENT):
         TOKEN_NOTE = "using the DHAN_ACCESS_TOKEN secret (no auto token: DHAN_PIN / DHAN_TOTP_SECRET missing)"
         return
+    if force:
+        try:
+            os.remove(TOKEN_FILE)
+        except OSError:
+            pass
     try:
         with open(TOKEN_FILE) as f:
             j = json.load(f)
@@ -134,6 +145,18 @@ def ensure_token():
         TOKEN_NOTE = "auto token FAILED - using the DHAN_ACCESS_TOKEN secret"
 
 
+def _refresh_token():
+    """Dhan rejected the saved token: make ONE new token per run (Dhan allows only 5 active tokens per account)."""
+    global REFRESHED
+    if REFRESHED or not (DHAN_PIN and DHAN_TOTP_SECRET and DHAN_CLIENT):
+        return False
+    REFRESHED = True
+    old = DHAN_TOKEN
+    print("Dhan token rejected - making a new one")
+    ensure_token(force=True)
+    return bool(DHAN_TOKEN) and DHAN_TOKEN != old
+
+
 def _dhan_chunk(sec_id, interval, start, end):
     body = {"securityId": str(sec_id), "exchangeSegment": "IDX_I", "instrument": "INDEX", "interval": interval,
             "oi": False, "fromDate": start.strftime("%Y-%m-%d 00:00:00"), "toDate": end.strftime("%Y-%m-%d 23:59:59")}
@@ -147,6 +170,11 @@ def _dhan_chunk(sec_id, interval, start, end):
             continue
         if r.status_code == 200:
             return r.json()
+        if r.status_code in (401, 403) or "DH-901" in r.text or "DH-902" in r.text:
+            if _refresh_token():
+                hdr["access-token"] = DHAN_TOKEN
+                continue
+            raise RuntimeError(f"Dhan login rejected (HTTP {r.status_code}) {r.text[:120]}")
         if r.status_code in (429, 500, 502, 503, 504):
             print(f"  Dhan HTTP {r.status_code}; retry {attempt + 1}/5")
             _time.sleep(2 ** attempt)
@@ -190,19 +218,30 @@ def fetch_dhan(name, interval_min, days):
     return _session_only(d)
 
 
+DHAN_DOWN = {"v": False}
+
+
 def fetch(name, interval_min, days):
     try:
-        return fetch_dhan(name, interval_min, days)
+        if DHAN_DOWN["v"] and YAHOO_BACKUP and not LOCAL_DIR:
+            raise RuntimeError("Dhan already failed in this run")
+        d = fetch_dhan(name, interval_min, days)
+        SRC.setdefault(name, "Dhan")
+        return d
     except Exception as e:
         if not (YAHOO_BACKUP and not LOCAL_DIR):
             raise
+        DHAN_DOWN["v"] = True
         print(f"{name} {interval_min}m: Dhan failed ({e}); using Yahoo backup")
-        return fetch_yahoo(name, interval_min, days)
+        PROBLEMS.append(f"{name}: Dhan data failed, alerts use Yahoo data \u2014 {str(e)[:140]}")
+        d = fetch_yahoo(name, interval_min, days)
+        SRC[name] = "Yahoo"
+        return d
 
 
 def fetch_daily(name, m60, days):
     """Daily candles (index = date) for the 1D / 1W / 1M star charts. Dhan daily endpoint; if it fails, built from 60m."""
-    if not LOCAL_DIR:
+    if not LOCAL_DIR and not DHAN_DOWN["v"]:
         try:
             now = now_ist()
             body = {"securityId": str(SYMBOLS[name]), "exchangeSegment": "IDX_I", "instrument": "INDEX", "expiryCode": 0, "oi": False,
@@ -579,8 +618,10 @@ def box_message(name, tf, ev, dur, c):
 # ───────────────────────── 3) DARK EOB on 15m ─────────────────────────
 def eob_dark_events(c, pivot_len=1, back_max=10):
     """Bar-by-bar port of TRIDENT V3.56 EOB with the sweep test and the dark (FVG) test.
-    c = closed 15m candles (index = candle start). Returns one dict per EOB that became DARK:
-    dir (+1 green / -1 red), sweep, swing_t, level, top, bot, dark_k (candle where it turned dark), inv_k."""
+    c = closed 15m candles (index = candle start). Returns one dict per alert:
+      kind "dark"  - an EOB that turned DARK (dark_k = candle where it turned dark)
+      kind "sweep" - a SWEEP EOB that just formed (form_k = the candle that confirmed it)
+    with dir (+1 green / -1 red), sweep, swing_t, level, top, bot, inv_k."""
     assert pivot_len == 1
     pl = pivot_len
     O, H, L, C = (c[x].values.astype(float) for x in ("open", "high", "low", "close"))
@@ -622,7 +663,7 @@ def eob_dark_events(c, pivot_len=1, back_max=10):
                 else:
                     top = bh; bot = top_b if (bh - top_b) >= 0.05 else bh - qtr
                 recs.append(dict(dir=-1 if bear else 1, p=p, bP=bP, level=float(H[p] if bear else L[p]), top=float(top), bot=float(bot),
-                                 sweep=swpH if bear else swpL, dark_k=None, inv_k=None))
+                                 sweep=swpH if bear else swpL, dark_k=None, inv_k=None, form_k=k))
         if isSH:
             untH.append(H[p]); untH = untH[-SWP_KEEP:]
         if isSL:
@@ -638,23 +679,28 @@ def eob_dark_events(c, pivot_len=1, back_max=10):
                         r["dark_k"] = k; break
     out = []
     for r in recs:
-        if r["dark_k"] is None:
-            continue
-        if r["inv_k"] is not None and r["inv_k"] <= r["dark_k"]:
-            continue                                   # invalid by the time it turned dark -> TRIDENT hides it
-        r = dict(r); r["swing_t"] = idx[r["p"]]
-        out.append(r)
+        dark_ok = r["dark_k"] is not None and not (r["inv_k"] is not None and r["inv_k"] <= r["dark_k"])
+        if r["sweep"] and SWEEP_EOB and not (dark_ok and r["dark_k"] == r["form_k"]):
+            if r["inv_k"] is None or r["inv_k"] > r["form_k"]:
+                e = dict(r); e["swing_t"] = idx[r["p"]]; e["kind"] = "sweep"; e["k"] = r["form_k"]
+                out.append(e)
+        if dark_ok:                                    # invalid before it turned dark -> TRIDENT hides it, no alert
+            e = dict(r); e["swing_t"] = idx[r["p"]]; e["kind"] = "dark"; e["k"] = r["dark_k"]
+            out.append(e)
     return out
 
 
 def eob_message(name, ev, c):
     red = ev["dir"] == -1
-    label = ("Dark Sweep EOB" if ev["sweep"] else "Dark EOB") + (" (red)" if red else " (green)")
+    side = " (red)" if red else " (green)"
+    if ev["kind"] == "sweep":
+        label, last = "Sweep EOB" + side, f"Formed on the {fmt_t(c.index[ev['k']])} candle"
+    else:
+        label, last = ("Dark Sweep EOB" if ev["sweep"] else "Dark EOB") + side, f"Turned dark on the {fmt_t(c.index[ev['k']])} candle"
     return "\n".join([
         f"{'🔴' if red else '🟢'} <b>{name} 15m · {label}</b>",
-        f"Box {ev['bot']:.2f} – {ev['top']:.2f}",
         f"Swing {ev['level']:.2f} · {fmt_t(ev['swing_t'])}",
-        f"Turned dark on the {fmt_t(c.index[ev['dark_k']])} candle"])
+        last])
 
 
 # ───────────────────────── STATE + TELEGRAM ─────────────────────────
@@ -826,17 +872,21 @@ def run_symbol(name, now, state):
         try:
             c = build_tf(m15, 15, "15m", now)
             evs = eob_dark_events(c)
-            n_today = 0
+            n_dark = n_swp = 0
             for ev in evs:
-                dend = c["end"].iloc[ev["dark_k"]]
+                dend = c["end"].iloc[ev["k"]]
                 if dend.date() != today:
                     continue
-                n_today += 1
-                skey = f"{name}|eob15m|{ev['swing_t'].isoformat()}|{ev['dir']}"
+                if ev["kind"] == "dark":
+                    n_dark += 1
+                    skey = f"{name}|eob15m|{ev['swing_t'].isoformat()}|{ev['dir']}"
+                else:
+                    n_swp += 1
+                    skey = f"{name}|swp15m|{ev['swing_t'].isoformat()}|{ev['dir']}"
                 if skey in state:
                     continue
                 sent += dispatch(state, skey, eob_message(name, ev, c))
-            print(f"{name} 15m EOB: {len(c)} candles, {n_today} dark EOB(s) today")
+            print(f"{name} 15m EOB: {len(c)} candles, {n_swp} sweep EOB(s), {n_dark} dark EOB(s) today")
         except Exception as e:
             print(f"{name} 15m EOB: error {e}")
             PROBLEMS.append(f"{name} 15m EOB: error {e}"[:200])
@@ -882,16 +932,23 @@ def report(st, ok):
     """Telegram status: problems (each once a day) and one 'bot running' message a day after the data loaded."""
     if not STATUS_MSG:
         return
-    new = [p for p in dict.fromkeys(PROBLEMS) if p[:60] not in st["told"]]
+    key = lambda p: p.split(" \u2014 ")[0][:80]
+    new, seen = [], set()
+    for p in PROBLEMS:
+        if key(p) in st["told"] or key(p) in seen:
+            continue
+        seen.add(key(p)); new.append(p)
     if new:
         txt = "⚠️ <b>TRIDENT bot problem</b>\n" + "\n".join("• " + p.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;") for p in new[:5])
         if send(txt) is not None:
-            st["told"] += [p[:60] for p in new]
-    if not st.get("hello") and ok and not PROBLEMS:
+            st["told"] += [key(p) for p in new]
+    if not st.get("hello") and ok:
         now = now_ist()
+        src = ", ".join(f"{n} ({SRC.get(n, 'Dhan')})" for n in ok)
         txt = (f"✅ <b>TRIDENT bot running</b> · {now:%d %b %H:%M} IST\n"
-               f"Dhan: {TOKEN_NOTE or 'login OK'}\nData OK: {', '.join(ok)}\n"
-               f"Watching: 3-star groups {','.join(STAR_TFS)} · box breaks {','.join(BOX_TFS) or 'off'} · dark EOB 15m {'on' if EOB_ON else 'off'}\n"
+               f"Dhan: {TOKEN_NOTE or 'login OK'}\nData: {src}\n"
+               f"Watching: 3-star groups {','.join(STAR_TFS)} · box breaks {','.join(BOX_TFS) or 'off'} · "
+               f"15m EOB {'sweep + dark' if (EOB_ON and SWEEP_EOB) else 'dark' if EOB_ON else 'off'}\n"
                "Alerts come only when something forms - a quiet day is normal.")
         if send(txt) is not None:
             st["hello"] = True

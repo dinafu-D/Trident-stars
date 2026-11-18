@@ -1,6 +1,10 @@
 name: TRIDENT alert
 on:
-  workflow_dispatch:        # started every 5 minutes by cron-job.org (and by "Run workflow" for a test)
+  workflow_dispatch:
+  schedule:
+    - cron: "45,50,55 3 * * 1-5"
+    - cron: "*/5 4-9 * * 1-5"
+    - cron: "0,5,10,15 10 * * 1-5"
 concurrency:
   group: trident-alert
   cancel-in-progress: false

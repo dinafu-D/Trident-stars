@@ -1,0 +1,44 @@
+name: TRIDENT alert
+on:
+  workflow_dispatch:        # started every 5 minutes by cron-job.org (and by "Run workflow" for a test)
+concurrency:
+  group: trident-alert
+  cancel-in-progress: false
+permissions:
+  contents: write
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Today's date (IST)
+        id: d
+        run: echo "day=$(TZ=Asia/Kolkata date +%F)" >> "$GITHUB_OUTPUT"
+      - name: Keep today's Dhan token between runs
+        uses: actions/cache@v4
+        with:
+          path: .cache
+          key: dhan-token-${{ steps.d.outputs.day }}
+      - name: Run bot
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DHAN_CLIENT_ID: ${{ secrets.DHAN_CLIENT_ID }}
+          DHAN_PIN: ${{ secrets.DHAN_PIN }}
+          DHAN_TOTP_SECRET: ${{ secrets.DHAN_TOTP_SECRET }}
+          DHAN_ACCESS_TOKEN: ${{ secrets.DHAN_ACCESS_TOKEN }}
+          YAHOO_BACKUP: "0"
+        run: python trident_alert.py
+      - name: Save state
+        if: always()
+        run: |
+          git config user.name "trident-bot"
+          git config user.email "trident-bot@users.noreply.github.com"
+          git add state/sent_stars.json || true
+          git diff --cached --quiet || (git commit -m "state" && git pull --rebase -q && git push)

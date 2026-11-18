@@ -35,7 +35,7 @@ jobs:
           DHAN_PIN: ${{ secrets.DHAN_PIN }}
           DHAN_TOTP_SECRET: ${{ secrets.DHAN_TOTP_SECRET }}
           DHAN_ACCESS_TOKEN: ${{ secrets.DHAN_ACCESS_TOKEN }}
-          YAHOO_BACKUP: "0"
+          YAHOO_BACKUP: "1"
         run: python trident_alert.py
       - name: Save state
         if: always()

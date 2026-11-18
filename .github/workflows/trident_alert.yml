@@ -1,10 +1,8 @@
 name: TRIDENT alert
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "45,50,55 3 * * 1-5"
-    - cron: "*/5 4-9 * * 1-5"
-    - cron: "0,5,10,15 10 * * 1-5"
+  repository_dispatch:
+    types: [trident]
 concurrency:
   group: trident-alert
   cancel-in-progress: false

@@ -66,12 +66,9 @@
   ]
  },
  "_status": {
-  "day": "2026-11-18",
+  "day": "2026-11-19",
   "hello": true,
-  "told": [
-   "NIFTY: no data - Dhan HTTP 400: {\"errorType\":\"Order_Error\",\"",
-   "SENSEX: no data - Dhan HTTP 400: {\"errorType\":\"Order_Error\","
-  ]
+  "told": []
  },
- "_last_run": "2026-11-18T15:40:41.710785+05:30"
+ "_last_run": "2026-11-19T09:15:51.833294+05:30"
 }

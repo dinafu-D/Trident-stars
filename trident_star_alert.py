@@ -30,6 +30,11 @@ import pandas as pd
 import requests
 
 try:
+    import eob_alert            # 1h EOB alerts (normal / dark / sweep colours)
+except ImportError:
+    eob_alert = None
+
+try:
     import conbox_alert         # 5m con box formed / break + trend alerts
 except ImportError:
     conbox_alert = None
@@ -280,14 +285,17 @@ def save_state(state):
         json.dump(state, f, indent=1)
 
 
-def send(text):
-    """Send a Telegram message. Returns its message id (truthy) or None if it failed."""
+def send(text, reply_to=None):
+    """Send a Telegram message (optionally as a reply). Returns its message id (truthy) or None if it failed."""
     if not TG_TOKEN or not TG_CHAT:
         print("[no Telegram secrets] would send:\n" + text)
         return -1
+    body = {"chat_id": TG_CHAT, "text": text, "parse_mode": "HTML"}
+    if reply_to and reply_to > 0:
+        body["reply_to_message_id"] = reply_to
+        body["allow_sending_without_reply"] = True
     try:
-        r = requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-                          json={"chat_id": TG_CHAT, "text": text, "parse_mode": "HTML"}, timeout=20)
+        r = requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage", json=body, timeout=20)
     except Exception as e:
         print("Telegram error:", e)
         return None
@@ -303,6 +311,20 @@ DELETE_TAKEN = os.getenv("DELETE_TAKEN", "1") == "1"   # delete an alert once it
 def remember_msg(state, skey, mid, text):
     if DELETE_TAKEN and isinstance(mid, int) and not isinstance(mid, bool) and mid > 0:
         state.setdefault("_msgs", {})[skey] = [mid, now_ist().isoformat(), text.split("\n")[0]]
+
+
+def edit_msg(mid, text):
+    """Replace the text of a message the bot sent earlier."""
+    if not TG_TOKEN or not TG_CHAT or not mid or mid <= 0:
+        print(f"[no Telegram secrets] would edit message {mid}:\n{text}")
+        return True
+    try:
+        r = requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/editMessageText", timeout=20, json={
+            "chat_id": TG_CHAT, "message_id": mid, "parse_mode": "HTML", "text": text})
+        return r.ok or "not modified" in r.text
+    except Exception as e:
+        print("Telegram edit error:", e)
+        return False
 
 
 def delete_msg(mid, head):
@@ -364,7 +386,7 @@ def main():
     sent_any = 0
     data_errors = []
     for name, ticker in SYMBOLS.items():
-        want_h1 = any(t in ("1h", "4h") for t in CHART_TFS)
+        want_h1 = any(t in ("1h", "4h") for t in CHART_TFS) or bool(eob_alert and eob_alert.EOB_ON)
         src = "Dhan"
         try:
             if not (dhan_data and dhan_data.enabled()):
@@ -380,6 +402,11 @@ def main():
                 sent_any += conbox_alert.run(name, m5, state, now, send)
             except Exception as e:
                 print(f"{name}: con box error {e}")
+        if eob_alert:
+            try:
+                sent_any += eob_alert.run(name, h1, state, now, send, edit_msg, remember_msg, delete_taken)
+            except Exception as e:
+                print(f"{name}: EOB error {e}")
         intraday_htf = {"15m": build_bars(m5, "15m", now), "1h": build_bars(m5, "1h", now),
                         "4h": build_bars(m5, "4h", now), "1D": build_daily(d1, now)}
         for tf in CHART_TFS:

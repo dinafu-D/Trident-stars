@@ -1,46 +1,61 @@
-name: TRIDENT alert
+name: TRIDENT 3-Star Alert
+
 on:
+  schedule:
+    # times are UTC (IST = UTC + 5:30) -> runs every 5 min, 09:15 to 15:45 IST, Mon-Fri
+    - cron: "45,50,55 3 * * 1-5"
+    - cron: "*/5 4-9 * * 1-5"
+    - cron: "0,5,10,15 10 * * 1-5"
   workflow_dispatch:
-  repository_dispatch:
-    types: [trident]
+    inputs:
+      force:
+        description: "Run even outside market hours (1 = yes)"
+        default: "0"
+
 concurrency:
-  group: trident-alert
+  group: trident-stars
   cancel-in-progress: false
-permissions:
-  contents: write
+
 jobs:
-  run:
+  check:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 8
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: pip
+
       - run: pip install -r requirements.txt
-      - name: Today's date (IST)
-        id: d
-        run: echo "day=$(TZ=Asia/Kolkata date +%F)" >> "$GITHUB_OUTPUT"
-      - name: Keep today's Dhan token between runs
-        uses: actions/cache@v4
+
+      # remembers which groups were already sent, so you never get the same alert twice
+      - name: Restore sent-alert memory
+        uses: actions/cache/restore@v4
         with:
-          path: .cache
-          key: dhan-token-${{ steps.d.outputs.day }}
-      - name: Run bot
+          path: state
+          key: star-state-${{ github.run_id }}
+          restore-keys: star-state-
+
+      - name: Check for new 3-star groups
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           DHAN_CLIENT_ID: ${{ secrets.DHAN_CLIENT_ID }}
           DHAN_PIN: ${{ secrets.DHAN_PIN }}
           DHAN_TOTP_SECRET: ${{ secrets.DHAN_TOTP_SECRET }}
-          DHAN_ACCESS_TOKEN: ${{ secrets.DHAN_ACCESS_TOKEN }}
-          YAHOO_BACKUP: "1"
-        run: python trident_alert.py
-      - name: Save state
+          CHART_TFS: "5m,15m,1h"
+          CONBOX_ALERTS: "1"      # 5m con box formed / break alerts (0 = off)
+          TREND_ALERTS: "1"       # 5m trend change alerts, HH-HL / LH-LL + EMA 6 (0 = off)
+          SKIP_15M: "1"
+          ALERT_2STAR: "1"
+          FORCE: ${{ github.event.inputs.force || '0' }}
+        run: python trident_star_alert.py
+
+      - name: Save sent-alert memory
         if: always()
-        run: |
-          git config user.name "trident-bot"
-          git config user.email "trident-bot@users.noreply.github.com"
-          git add state/sent_stars.json || true
-          git diff --cached --quiet || (git commit -m "state" && git pull --rebase -q && git push)
+        uses: actions/cache/save@v4
+        with:
+          path: state
+          key: star-state-${{ github.run_id }}

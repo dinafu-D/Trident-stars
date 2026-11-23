@@ -50,7 +50,7 @@ jobs:
           TREND_ALERTS: "1"       # 5m trend change alerts, HH-HL / LH-LL + EMA 6 (0 = off)
           EOB_ALERTS: "1"         # 1h EOB alerts with colour: normal / dark / sweep (0 = off)
           SKIP_15M: "1"
-          ALERT_2STAR: "1"
+          ALERT_2STAR: "0"        # 0 = only complete 3-star groups
           FORCE: ${{ github.event.inputs.force || '0' }}
         run: python trident_star_alert.py
 

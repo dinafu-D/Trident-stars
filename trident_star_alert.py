@@ -18,7 +18,7 @@ HTF pivot history = last 20 pivots per timeframe, exact price match (tolerance 0
 Alerts (each sent once, only if it formed today and is still live):
   * 2 stars  = anchor + 1 untaken swing after it  -> heads-up, the next swing on that side completes the group
   * 3 stars  = complete group
-Data: Dhan Data API (dhan_data.py). Candles are rebuilt from 5m data so prices match exactly.
+Data: Dhan Data API (dhan_data.py); Yahoo Finance as backup when Dhan is not available.
 """
 
 import json
@@ -77,7 +77,7 @@ def fetch(ticker):
     d1 = t.history(interval="1d", period="max", auto_adjust=False)
     if m5.empty:
         raise RuntimeError(f"no 5m data for {ticker}")
-    m5 = m5.tz_convert(IST)[["High", "Low", "Close"]].dropna().round(2)
+    m5 = m5.tz_convert(IST)[["Open", "High", "Low", "Close"]].dropna().round(2)
     m5 = m5[(m5.index.time >= SESSION_OPEN) & (m5.index.time < SESSION_CLOSE)]
     d1 = d1[["High", "Low"]].dropna().round(2)
     d1.index = pd.to_datetime(d1.index.date)
@@ -90,7 +90,7 @@ def fetch_hourly(ticker):
     h = yf.Ticker(ticker).history(interval="60m", period="729d", auto_adjust=False)
     if h.empty:
         raise RuntimeError(f"no 1h data for {ticker}")
-    h = h.tz_convert(IST)[["High", "Low", "Close"]].dropna().round(2)
+    h = h.tz_convert(IST)[["Open", "High", "Low", "Close"]].dropna().round(2)
     return h[(h.index.time >= SESSION_OPEN) & (h.index.time < SESSION_CLOSE)]
 
 
@@ -393,9 +393,17 @@ def main():
                 raise RuntimeError("Dhan secrets DHAN_CLIENT_ID / DHAN_PIN / DHAN_TOTP_SECRET not set")
             m5, d1, h1 = dhan_data.fetch(name, now, want_h1)
         except Exception as e:
-            print(f"{name}: Dhan data error {e}")
+            # Dhan not available (no subscription, login problem, ...) -> Yahoo Finance backup
+            print(f"{name}: Dhan data error {e} -> using Yahoo")
             data_errors.append(f"{name}: {str(e)[:150]}")
-            continue
+            try:
+                src = "Yahoo"
+                m5, d1 = fetch(ticker)
+                h1 = fetch_hourly(ticker) if want_h1 else None
+            except Exception as e2:
+                print(f"{name}: Yahoo data error {e2}")
+                data_errors[-1] += f" | Yahoo also failed: {str(e2)[:100]}"
+                continue
         print(f"{name}: data from {src}, last 5m candle {m5.index[-1]:%d %b %H:%M}")
         if conbox_alert:
             try:
@@ -458,7 +466,7 @@ def main():
         # tell you on Telegram, at most once an hour, so a Dhan problem never goes unnoticed
         last = state.get("_dhan_warn", "")
         if not last or now - pd.Timestamp(last) > pd.Timedelta(hours=1):
-            send("⚠️ Star bot: could not get Dhan data\n" + "\n".join(data_errors))
+            send("⚠️ Star bot: Dhan data not available — using Yahoo (can be a few minutes late)\n" + "\n".join(data_errors))
             state["_dhan_warn"] = now.isoformat()
     save_state(state)
     print(f"sent {sent_any} alert(s)")

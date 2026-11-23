@@ -2,3 +2,4 @@ pandas
 requests
 pyotp
 cryptography
+yfinance>=0.2.54

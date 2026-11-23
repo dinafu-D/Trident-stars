@@ -52,7 +52,7 @@ SKIP_15M = os.getenv("SKIP_15M", "1") == "1"   # TRIDENT default: ON (only 1h / 
 PIVOT_LEN = 1                                  # TRIDENT "Swing Left/Right Candles"
 PIV_CAP = 20                                   # TRIDENT swingTFLookback
 SWING_CAP = 100                                # TRIDENT max active swing highs / lows
-ALERT_2STAR = os.getenv("ALERT_2STAR", "1") == "1"   # heads-up when anchor + 1 swing exist (3rd star pending)
+ALERT_2STAR = os.getenv("ALERT_2STAR", "0") == "1"   # heads-up when anchor + 1 swing exist (3rd star pending)
 
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -363,14 +363,22 @@ def fmt_t(ts):
 
 
 def message(name, tf, side, g, formed_at, last_price, live=True):
-    """🔴 NIFTY 5m ★★★ / ★ (1h) price · date time / ★★ ... / ★★★ ...   (🔴 swing highs, 🟢 swing lows)"""
+    """Neat star alert:
+    🔴 NIFTY 5m · 3 STARS ★★★
+    On swing HIGHS (resistance)
+    1st ★  24612.30 · 23 Nov 10:05 · on 1h swing
+    2nd ★  24605.10 · 23 Nov 10:40 · 0.03% from 1st
+    3rd ★  24598.55 · 23 Nov 11:15 · 0.03% from 2nd"""
     ft = (lambda t: t.strftime("%d %b %Y")) if tf in ("1D", "1W", "1M") else fmt_t
-    lines = [f"{'🔴' if side else '🟢'} <b>{name} {tf}</b> {'★' * len(g)}",
-             f"★ ({g[0]['anc_tf']}) {g[0]['lvl']:.2f} · {ft(g[0]['t'])}"]
-    for i, x in enumerate(g[1:], start=2):
-        prev = g[i - 2]["lvl"]
+    n = len(g)
+    lines = [f"{'🔴' if side else '🟢'} <b>{name} {tf} · {n} STARS {'★' * n}</b>",
+             "On swing HIGHS (resistance)" if side else "On swing LOWS (support)",
+             f"1st ★  {g[0]['lvl']:.2f} · {ft(g[0]['t'])} · on {g[0]['anc_tf']} swing"]
+    names = ["1st", "2nd", "3rd"]
+    for i, x in enumerate(g[1:], start=1):
+        prev = g[i - 1]["lvl"]
         pct = abs(x["lvl"] - prev) / prev * 100          # gap from the previous star
-        lines.append(f"{'★' * i} {x['lvl']:.2f} · {ft(x['t'])}   ({pct:.2f}%)")
+        lines.append(f"{names[i]} ★  {x['lvl']:.2f} · {ft(x['t'])} · {pct:.2f}% from {names[i - 1]}")
     return "\n".join(lines)
 
 
@@ -466,7 +474,7 @@ def main():
         # tell you on Telegram, at most once an hour, so a Dhan problem never goes unnoticed
         last = state.get("_dhan_warn", "")
         if not last or now - pd.Timestamp(last) > pd.Timedelta(hours=1):
-            send("⚠️ Star bot: Dhan data not available — using Yahoo (can be a few minutes late)\n" + "\n".join(data_errors))
+            send("⚠️ <b>Dhan data not working</b>\nUsing Yahoo for now (alerts may be a few minutes late)\nReason: " + " | ".join(data_errors))
             state["_dhan_warn"] = now.isoformat()
     save_state(state)
     print(f"sent {sent_any} alert(s)")

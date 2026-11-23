@@ -128,13 +128,16 @@ def _fmt(ms):
 
 
 def message(name, r):
+    """🟪 NIFTY 1h · EOB PURPLE / Bearish · sweep / Zone / Swing high / Invalid if ..."""
     emo, col = COLOURS[("bear" if r["bear"] else "bull", r["hp"], r["swp"])]
-    kind = ("bear" if r["bear"] else "bull") + (" · sweep" if r["swp"] else "") + (" · FVG" if r["hp"] else "")
+    kind = ("Bearish (sell zone)" if r["bear"] else "Bullish (buy zone)") + \
+           (" · swept liquidity" if r["swp"] else "") + (" · FVG followed" if r["hp"] else "")
     side = "high" if r["bear"] else "low"
     return "\n".join([
-        f"{emo} <b>{name} {TF} EOB</b> — {col} ({kind})",
-        f"Zone {r['bot']:.2f} – {r['top']:.2f}",
-        f"Swing {side} {r['lvl']:.2f} · {_fmt(r['swT'])}",
+        f"{emo} <b>{name} {TF} · EOB {col}</b>",
+        kind,
+        f"Zone: {r['bot']:.2f} – {r['top']:.2f}",
+        f"Swing {side}: {r['lvl']:.2f} · {_fmt(r['swT'])}",
         f"Invalid if a {TF} candle closes {'above' if r['bear'] else 'below'} {r['lvl']:.2f}"])
 
 
@@ -172,7 +175,7 @@ def run(name, h1, state, now, send, edit, remember, delete_taken):
                 edit(mid, txt)
                 msgs[skey][2] = txt.split("\n")[0]
             emo, col = COLOURS[("bear" if r["bear"] else "bull", True, r["swp"])]
-            rtxt = f"{emo} <b>{name} {TF} EOB</b> {_fmt(r['swT'])} → now <b>{col}</b> (FVG followed)"
+            rtxt = f"{emo} <b>{name} {TF} · EOB {_fmt(r['swT'])} is now {col}</b> (FVG followed)"
             rid = send(rtxt, reply_to=mid)
             if rid:
                 remember(state, skey + "|re", rid, rtxt)          # deleted together with the alert later

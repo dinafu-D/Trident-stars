@@ -285,8 +285,9 @@ def _fmt_t(ms):
 
 
 def _trend_line(tr):
-    d = "UP ▲" if tr["dir"] == 1 else "DOWN ▼" if tr["dir"] == -1 else "SIDEWAYS"
-    s = ("HH" if tr["hT"] == 1 else "LH" if tr["hT"] == -1 else "-") + " · " + \
+    """Trend: UP ▲ (HH + HL) · above EMA6 ✓"""
+    d = "UP ▲" if tr["dir"] == 1 else "DOWN ▼" if tr["dir"] == -1 else "SIDEWAYS ↔"
+    s = ("HH" if tr["hT"] == 1 else "LH" if tr["hT"] == -1 else "-") + " + " + \
         ("HL" if tr["lT"] == 1 else "LL" if tr["lT"] == -1 else "-")
     e = "above" if tr["eSide"] == 1 else "below" if tr["eSide"] == -1 else "on"
     ok = " ✓" if tr["conf"] != 0 else ""
@@ -295,26 +296,27 @@ def _trend_line(tr):
 
 def message(name, ev):
     tr = ev["trend"]
+    when = _fmt_t(ev["end"] - TF_MIN * 60000)
     if ev["kind"] == "T":
         up = tr["conf"] == 1
         return "\n".join([
-            f"{'🟢' if up else '🔴'} <b>{name} 5m</b> TREND {'UP ▲' if up else 'DOWN ▼'}",
-            f"{'HH' if tr['hT'] == 1 else 'LH'} {tr['lastH']:.2f} · {'HL' if tr['lT'] == 1 else 'LL'} {tr['lastL']:.2f}",
-            f"Close {ev['close']:.2f} {'above' if up else 'below'} EMA{EMA_LEN} {tr['ema']:.2f} ✓",
-            f"{_fmt_t(ev['end'] - TF_MIN * 60000)}"])
+            f"{'🟢' if up else '🔴'} <b>{name} 5m · TREND {'UP ▲' if up else 'DOWN ▼'}</b>",
+            (f"Higher High {tr['lastH']:.2f} · Higher Low {tr['lastL']:.2f}" if up else
+             f"Lower High {tr['lastH']:.2f} · Lower Low {tr['lastL']:.2f}"),
+            f"Price {ev['close']:.2f} {'above' if up else 'below'} EMA{EMA_LEN} {tr['ema']:.2f} ✓",
+            f"Time: {when}"])
     b = ev["box"]
     pct = (b["hi"] - b["lo"]) / b["lo"] * 100 if b["lo"] else 0
+    box = f"Box: {b['lo']:.2f} – {b['hi']:.2f} ({pct:.2f}%)"
     if ev["kind"] == "F":
-        head = f"⬜ <b>{name} 5m</b> CON BOX"
-        mid = [f"High {b['hi']:.2f} · Low {b['lo']:.2f} ({pct:.2f}%)",
-               f"Since {_fmt_t(b['firstT'])} · {b['dur']}"]
+        lines = [f"⬜ <b>{name} 5m · CON BOX FORMED</b>", box,
+                 f"Started {_fmt_t(b['firstT'])} · running {b['dur']}"]
     else:
-        head = {"U": f"🟢 <b>{name} 5m</b> CON BOX — BREAK UP ⬆",
-                "D": f"🔴 <b>{name} 5m</b> CON BOX — BREAK DOWN ⬇",
-                "B": f"🟣 <b>{name} 5m</b> CON BOX — B (both sides)"}[ev["kind"]]
-        mid = [f"Box {b['lo']:.2f} – {b['hi']:.2f} ({pct:.2f}%) · {b['dur']}",
-               f"Close {ev['close']:.2f} · {_fmt_t(ev['end'] - TF_MIN * 60000)}"]
-    return "\n".join([head] + mid + [_trend_line(tr)])
+        head = {"U": f"🟢 <b>{name} 5m · CON BOX BROKEN UP ⬆</b>",
+                "D": f"🔴 <b>{name} 5m · CON BOX BROKEN DOWN ⬇</b>",
+                "B": f"🟣 <b>{name} 5m · CON BOX BROKEN BOTH SIDES</b>"}[ev["kind"]]
+        lines = [head, f"{box} · lasted {b['dur']}", f"Closed at {ev['close']:.2f} · {when}"]
+    return "\n".join(lines + [_trend_line(tr)])
 
 
 # ───────────────────────── run (called from trident_star_alert.main) ─────────────────────────

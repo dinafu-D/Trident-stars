@@ -275,10 +275,13 @@ def save_state(state):
     cutoff = (now_ist() - pd.Timedelta(days=10)).isoformat()
     msgs = {k: v for k, v in state.get("_msgs", {}).items() if v[1] >= cutoff}
     warn = state.get("_dhan_warn")
+    cbstat = state.get("_cbstat")
     state = {k: v for k, v in state.items() if not k.startswith("_") and v >= cutoff}
     state["_msgs"] = msgs
     if warn:
         state["_dhan_warn"] = warn
+    if cbstat:
+        state["_cbstat"] = cbstat
     state["_last_run"] = now_ist().isoformat()
     os.makedirs(os.path.dirname(STATE_FILE) or ".", exist_ok=True)
     with open(STATE_FILE, "w") as f:
@@ -470,6 +473,11 @@ def main():
             if gone:
                 print(f"{name} {tf}: deleted {gone} alert(s) whose group was taken")
             print(f"{name} {tf}: {len(chart)} candles, {sum(len(g) == 3 for _, _, g in groups)} 3-star, {sum(len(g) == 2 for _, _, g in groups)} 2-star live")
+    if conbox_alert:
+        try:
+            sent_any += conbox_alert.send_status(state, now, send)
+        except Exception as e:
+            print(f"con box status error {e}")
     if data_errors:
         # tell you on Telegram, at most once an hour, so a Dhan problem never goes unnoticed
         last = state.get("_dhan_warn", "")

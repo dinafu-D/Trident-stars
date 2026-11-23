@@ -33,6 +33,11 @@ CHAIN_MIN = 3
 TICK = {"NIFTY": 0.05, "SENSEX": 0.01}
 
 
+LAST = {}          # last replay: boxes + closes (for the status message)
+STATUS = {}        # per index: (signature, text) for the combined status message
+STATUS_ON = os.getenv("CB_STATUS", "1") == "1"
+
+
 def _ms(ts):
     return int(pd.Timestamp(ts).value // 1_000_000)
 
@@ -124,12 +129,13 @@ def replay(m5, tick):
                 if close > rr["hi"] or close < rr["lo"]:
                     rr["live"] = False
                     rr["brk"] = rr["brk1"] = 1 if close > rr["hi"] else -1
+                    rr["brkIdx"] = i
                     rr["rightT"], rr["rightIdx"], rr["chg"] = t[i], i, i
                 else:
                     rr["rightIdx"], rr["rightT"], rr["chg"] = i, t[i], i
             elif not rr["dead"] and rr["brk"] in (1, -1):
                 if (rr["brk"] == 1 and close < rr["lo"]) or (rr["brk"] == -1 and close > rr["hi"]):
-                    rr["brk"], rr["chg"] = 2, i
+                    rr["brk"], rr["chg"], rr["bIdx"] = 2, i, i
         if curRec is not None and not curRec["live"]:
             cStopped = True
             if curRec["dead"]:
@@ -195,12 +201,14 @@ def replay(m5, tick):
                             cStopped = True
                             curRec["live"] = False
                             curRec["brk"] = curRec["brk1"] = 1 if C[j] > cHi else -1
+                            curRec["brkIdx"] = j
                             hitJ = j
                             break
                     if hitJ >= 0:
                         for j2 in range(hitJ + 1, i + 1):
                             if (curRec["brk"] == 1 and C[j2] < cLo) or (curRec["brk"] == -1 and C[j2] > cHi):
                                 curRec["brk"] = 2
+                                curRec["bIdx"] = j2
                                 break
                 else:
                     cBox["rightIdx"] = rI
@@ -234,6 +242,8 @@ def replay(m5, tick):
                                                              else (bA if bA else bB))
                             kp["brk1"] = 0 if kp["live"] else (bA if bA in (1, -1) else bB if bB in (1, -1)
                                                               else (kp["brk1"] or dp["brk1"]))
+                            kp["brkIdx"] = max(kp.get("brkIdx", -1), dp.get("brkIdx", -1))
+                            kp["bIdx"] = max(kp.get("bIdx", -1), dp.get("bIdx", -1))
                             kp["chg"] = i
                             kp["rightIdx"] = i if kp["live"] else t_idx.get(kp["rightT"], i)   # TRIDENT: bar at rightT
                             dp["live"], dp["dead"] = False, True
@@ -313,6 +323,23 @@ def replay(m5, tick):
             if r["id"] not in fm_ids:
                 fm_ids.add(r["id"])
                 events.append(dict(kind="F", end=end[i], key=f"F|{r['firstT']}", box=snap, trend=trend, close=close))
+                # price overlap with EARLIER boxes of the same day (separate in time, so TRIDENT keeps them apart)
+                day = pd.Timestamp(r["firstT"], unit="ms", tz=IST).date()
+                ovl = []
+                for o in recs:
+                    if o is r or o["dead"] or o["firstT"] >= r["firstT"]:
+                        continue
+                    if o["rightIdx"] - o["leftIdx"] + 1 < MIN_BARS:
+                        continue
+                    if pd.Timestamp(o["firstT"], unit="ms", tz=IST).date() != day:
+                        continue
+                    zlo, zhi = max(o["lo"], r["lo"]), min(o["hi"], r["hi"])
+                    if zlo <= zhi:
+                        ovl.append(dict(hi=o["hi"], lo=o["lo"], firstT=o["firstT"], rightT=o["rightT"],
+                                        brk=o["brk"], brk1=o["brk1"], dur=_dur(o), zlo=zlo, zhi=zhi))
+                if ovl:
+                    events.append(dict(kind="O", end=end[i], key=f"O|{r['firstT']}", box=snap, ovl=ovl,
+                                       trend=trend, close=close))
             prev = bk_prev.get(r["id"], 0)
             if r["brk"] != prev:
                 bk_prev[r["id"]] = r["brk"]
@@ -320,6 +347,7 @@ def replay(m5, tick):
                     k = "U" if r["brk"] == 1 else "D" if r["brk"] == -1 else "B"
                     events.append(dict(kind=k, end=end[i], key=f"{k}|{r['firstT']}|{t[i]}", box=snap,
                                        trend=trend, close=close))
+    LAST.update(recs=recs, C=C, t=t, end=end)          # final state, used by the status message
     return events
 
 
@@ -364,6 +392,8 @@ def _chain_message(name, ev):
 def message(name, ev):
     if ev["kind"] in ("HL", "LH"):
         return _chain_message(name, ev)
+    if ev["kind"] == "O":
+        return _overlap_message(name, ev)
     tr = ev["trend"]
     when = _fmt_t(ev["end"] - TF_MIN * 60000)
     if ev["kind"] == "T":
@@ -388,14 +418,114 @@ def message(name, ev):
     return "\n".join(lines + [_trend_line(tr)])
 
 
+# ───────────────────────── live con box status (one combined message, sent only on change) ─────────────────────────
+def _side_txt(b):
+    return "UP ⬆" if b == 1 else "DOWN ⬇" if b == -1 else "BOTH SIDES"
+
+
+def _hm(ms, with_date=False):
+    x = pd.Timestamp(ms, unit="ms", tz=IST)
+    return x.strftime("%d %b %H:%M" if with_date else "%H:%M")
+
+
+def _status_block(name, now):
+    """(signature, text) for one index, from the last replay."""
+    recs, C, t = LAST.get("recs") or [], LAST.get("C") or [], LAST.get("t") or []
+    boxes = [r for r in recs if not r["dead"] and r["rightIdx"] - r["leftIdx"] + 1 >= MIN_BARS]
+    if not boxes or not C:
+        return (f"{name}|none", f"<b>{name} 5m · NO CON BOX yet</b>")
+    r = max(boxes, key=lambda x: (x["rightT"], x["firstT"]))          # latest box (latest activity), like TRIDENT
+    c, hi, lo = C[-1], r["hi"], r["lo"]
+    rg = hi - lo
+    today = pd.Timestamp(now).date()
+    first_day = pd.Timestamp(r["firstT"], unit="ms", tz=IST).date()
+    since = _hm(r["firstT"], first_day != today)
+
+    if r["live"]:
+        x = (c - lo) / rg if rg > 0 else 0
+        lvl = 1.0 if x >= 1 else 0.75 if x >= 0.75 else 0.5 if x >= 0.5 else 0.25 if x >= 0.25 else 0.0
+        rows = []
+        for g in (1.0, 0.75, 0.5, 0.25, 0.0):
+            tag = f"{g:g}".ljust(4)
+            mark = f"  ◀ price {c:.2f}" if g == lvl else ""
+            rows.append(f"{tag} = {lo + rg * g:.2f}{mark}")
+        txt = "\n".join([f"<b>{name} 5m · INSIDE CON BOX · at {lvl:g}</b>",
+                         "<pre>" + "\n".join(rows) + "</pre>",
+                         f"Since {since} · running {_dur(r)}"])
+        return (f"{name}|IN|{r['firstT']}|{lvl}", txt)
+
+    # broken: TRIDENT label "1.5h U 1.6x" — U from the box low up, D from the box high down; B = side broken last
+    side = r["brk"] if r["brk"] in (1, -1) else -r["brk1"]
+    xm = (c - lo) / rg if side == 1 else (hi - c) / rg
+    lab = "U" if r["brk"] == 1 else "D" if r["brk"] == -1 else "B"
+    since_i = r.get("bIdx", -1) if r["brk"] == 2 else r.get("brkIdx", -1)
+    since_i = since_i if 0 <= since_i < len(C) else len(C) - 1
+    after = C[since_i:]
+    tg = []
+    for m in (1.5, 2.0):
+        lv = lo + m * rg if side == 1 else hi - m * rg
+        hit = any(v >= lv for v in after) if side == 1 else any(v <= lv for v in after)
+        tg.append((m, lv, hit))
+    brk_i = r.get("brkIdx", -1)
+    brk_t = _hm(t[brk_i] + TF_MIN * 60000, pd.Timestamp(t[brk_i], unit="ms", tz=IST).date() != today) if 0 <= brk_i < len(t) else "-"
+    b_i = r.get("bIdx", -1)
+    b_txt = ""
+    if r["brk"] == 2 and 0 <= b_i < len(t):
+        b_txt = f" · then {'DOWN' if r['brk1'] == 1 else 'UP'} at " + \
+                _hm(t[b_i] + TF_MIN * 60000, pd.Timestamp(t[b_i], unit="ms", tz=IST).date() != today)
+    emo = "🟢" if side == 1 else "🔴"
+    if r["brk"] == 2:
+        emo = "🟣"
+    head = f"<b>{name} 5m · CON BOX BROKEN {_side_txt(r['brk'])} · {_dur(r)} {lab} · {xm:.2f}x</b>"
+    if first_day != today:
+        head = f"<b>{name} 5m · NO CON BOX TODAY</b>\nLast box ({first_day:%d %b}): broken {_side_txt(r['brk'])} · {_dur(r)} {lab} · {xm:.2f}x"
+    rows = [f"{m:g}x".ljust(4) + f" = {lv:.2f}" + (" ✓" if hit else "") for m, lv, hit in tg]
+    txt = "\n".join([f"{emo} {head}",
+                     f"Box {lo:.2f} – {hi:.2f} · broke {'UP' if r['brk1'] == 1 else 'DOWN'} at {brk_t}" + b_txt,
+                     f"Price {c:.2f}",
+                     "<pre>" + "\n".join(rows) + "</pre>"])
+    sig = f"{name}|BRK|{r['firstT']}|{r['brk']}|{int(tg[0][2])}{int(tg[1][2])}|{first_day == today}"
+    return (sig, txt)
+
+
+def send_status(state, now, send):
+    """Send ONE combined NIFTY + SENSEX status message when any index's status changed."""
+    if not STATUS_ON or not STATUS:
+        return 0
+    sig = " || ".join(STATUS[k][0] for k in sorted(STATUS))
+    last = state.setdefault("_cbstat", {})
+    if last.get("sig") == sig:
+        return 0
+    txt = "\n\n".join([f"📦 <b>CON BOX STATUS · {pd.Timestamp(now).strftime('%d %b %H:%M')}</b>"] +
+                       [STATUS[k][1] for k in sorted(STATUS, key=lambda n: (n != "NIFTY", n))])
+    if send(txt):
+        last["sig"] = sig
+        return 1
+    return 0
+
+
+def _overlap_message(name, ev):
+    b = ev["box"]
+    lines = [f"🔀 <b>{name} 5m · CON BOX OVERLAP (same day)</b>"]
+    for o in ev["ovl"]:
+        st = "still active" if o["brk"] == 0 else f"broke {'UP' if o['brk1'] == 1 else 'DOWN'}" + (" (then B)" if o["brk"] == 2 else "")
+        lines.append(f"Earlier box: {o['lo']:.2f} – {o['hi']:.2f} · {_hm(o['firstT'])}–{_hm(o['rightT'])} · {st}")
+    lines.append(f"New box:     {b['lo']:.2f} – {b['hi']:.2f} · from {_hm(b['firstT'])}")
+    for o in ev["ovl"]:
+        lines.append(f"Overlap zone: {o['zlo']:.2f} – {o['zhi']:.2f} ({o['zhi'] - o['zlo']:.2f} pts)")
+    return "\n".join(lines)
+
+
 # ───────────────────────── run (called from trident_star_alert.main) ─────────────────────────
 def run(name, m5, state, now, send):
-    if not (CB_ON or TREND_ON or CHAIN_ON):
+    if not (CB_ON or TREND_ON or CHAIN_ON or STATUS_ON):
         return 0
     closed = m5[[(_ms(x) + TF_MIN * 60000) <= _ms(now) for x in m5.index]]
     if len(closed) < 10:
         return 0
     events = replay(closed, TICK.get(name, 0.05))
+    if STATUS_ON:
+        STATUS[name] = _status_block(name, now)
     cutoff = _ms(now) - WINDOW_MIN * 60000
     sent = 0
     for ev in events:
@@ -403,7 +533,7 @@ def run(name, m5, state, now, send):
             continue
         if ev["kind"] in ("HL", "LH") and not CHAIN_ON:
             continue
-        if ev["kind"] in ("F", "U", "D", "B") and not CB_ON:
+        if ev["kind"] in ("F", "U", "D", "B", "O") and not CB_ON:
             continue
         skey = f"{name}|cb5|{ev['key']}"
         if skey in state or ev["end"] < cutoff:

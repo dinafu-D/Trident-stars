@@ -45,9 +45,10 @@ jobs:
           DHAN_CLIENT_ID: ${{ secrets.DHAN_CLIENT_ID }}
           DHAN_PIN: ${{ secrets.DHAN_PIN }}
           DHAN_TOTP_SECRET: ${{ secrets.DHAN_TOTP_SECRET }}
-          CHART_TFS: "5m,15m,1h"
+          CHART_TFS: "1h"         # star groups: 1h chart only
           CONBOX_ALERTS: "1"      # 5m con box formed / break alerts (0 = off)
-          TREND_ALERTS: "1"       # 5m trend change alerts, HH-HL / LH-LL + EMA 6 (0 = off)
+          TREND_ALERTS: "0"       # separate trend-change alert off (trend line stays in con box alerts)
+          HLLH_ALERTS: "1"        # 5m: 3+ HL / LH in a row, one LL / HH in between allowed (0 = off)
           EOB_ALERTS: "1"         # 1h EOB alerts with colour: normal / dark / sweep (0 = off)
           SKIP_15M: "1"
           ALERT_2STAR: "0"        # 0 = only complete 3-star groups

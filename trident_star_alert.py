@@ -30,6 +30,11 @@ import pandas as pd
 import requests
 
 try:
+    import options_alert        # options con box table (ATM +-2 CE / PE), sent on a break
+except ImportError:
+    options_alert = None
+
+try:
     import eob_alert            # 1h EOB alerts (normal / dark / sweep colours)
 except ImportError:
     eob_alert = None
@@ -288,24 +293,42 @@ def save_state(state):
         json.dump(state, f, indent=1)
 
 
-def send(text, reply_to=None):
-    """Send a Telegram message (optionally as a reply). Returns its message id (truthy) or None if it failed."""
-    if not TG_TOKEN or not TG_CHAT:
+OPT_TG_TOKEN = os.getenv("OPT_TELEGRAM_BOT_TOKEN", "")
+OPT_TG_CHAT = os.getenv("OPT_TELEGRAM_CHAT_ID", "") or TG_CHAT
+
+
+def _tg_send(token, chat, text, reply_to=None):
+    if not token or not chat:
         print("[no Telegram secrets] would send:\n" + text)
         return -1
-    body = {"chat_id": TG_CHAT, "text": text, "parse_mode": "HTML"}
+    body = {"chat_id": chat, "text": text, "parse_mode": "HTML"}
     if reply_to and reply_to > 0:
         body["reply_to_message_id"] = reply_to
         body["allow_sending_without_reply"] = True
     try:
-        r = requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage", json=body, timeout=20)
+        r = requests.post(f"https://api.telegram.org/bot{token}/sendMessage", json=body, timeout=20)
     except Exception as e:
-        print("Telegram error:", e)
+        print("Telegram error:", str(e).replace(token, "***"))
         return None
     if not r.ok:
         print("Telegram error:", r.status_code, r.text)
         return None
     return r.json()["result"]["message_id"]
+
+
+def send(text, reply_to=None):
+    """Send on the main bot. Returns message id (truthy) or None if it failed."""
+    return _tg_send(TG_TOKEN, TG_CHAT, text, reply_to)
+
+
+def send_opt(text, reply_to=None):
+    """Send option messages on the separate options bot; falls back to the main bot if not set up."""
+    if OPT_TG_TOKEN:
+        mid = _tg_send(OPT_TG_TOKEN, OPT_TG_CHAT, text, reply_to)
+        if mid:
+            return mid
+        print("Options bot failed, sending on main bot instead")
+    return send(text, reply_to)
 
 
 DELETE_TAKEN = os.getenv("DELETE_TAKEN", "1") == "1"   # delete an alert once its star group is taken
@@ -316,18 +339,29 @@ def remember_msg(state, skey, mid, text):
         state.setdefault("_msgs", {})[skey] = [mid, now_ist().isoformat(), text.split("\n")[0]]
 
 
+def _tg_edit(token, chat, mid, text):
+    try:
+        r = requests.post(f"https://api.telegram.org/bot{token}/editMessageText", timeout=20, json={
+            "chat_id": chat, "message_id": mid, "parse_mode": "HTML", "text": text})
+        return r.ok or "not modified" in r.text
+    except Exception as e:
+        print("Telegram edit error:", str(e).replace(token, "***"))
+        return False
+
+
 def edit_msg(mid, text):
     """Replace the text of a message the bot sent earlier."""
     if not TG_TOKEN or not TG_CHAT or not mid or mid <= 0:
         print(f"[no Telegram secrets] would edit message {mid}:\n{text}")
         return True
-    try:
-        r = requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/editMessageText", timeout=20, json={
-            "chat_id": TG_CHAT, "message_id": mid, "parse_mode": "HTML", "text": text})
-        return r.ok or "not modified" in r.text
-    except Exception as e:
-        print("Telegram edit error:", e)
-        return False
+    return _tg_edit(TG_TOKEN, TG_CHAT, mid, text)
+
+
+def edit_opt(mid, text):
+    """Edit an option message: options bot first, main bot if it was sent there (fallback)."""
+    if OPT_TG_TOKEN and mid and mid > 0 and _tg_edit(OPT_TG_TOKEN, OPT_TG_CHAT, mid, text):
+        return True
+    return edit_msg(mid, text)
 
 
 def delete_msg(mid, head):
@@ -396,6 +430,7 @@ def main():
     today = now.date()
     sent_any = 0
     data_errors = []
+    dhan_m5 = {}                # index 5m candles from Dhan (for the options table)
     for name, ticker in SYMBOLS.items():
         want_h1 = any(t in ("1h", "4h") for t in CHART_TFS) or bool(eob_alert and eob_alert.EOB_ON)
         src = "Dhan"
@@ -416,6 +451,8 @@ def main():
                 data_errors[-1] += f" | Yahoo also failed: {str(e2)[:100]}"
                 continue
         print(f"{name}: data from {src}, last 5m candle {m5.index[-1]:%d %b %H:%M}")
+        if src == "Dhan":
+            dhan_m5[name] = m5
         if conbox_alert:
             try:
                 sent_any += conbox_alert.run(name, m5, state, now, send)
@@ -473,6 +510,11 @@ def main():
             if gone:
                 print(f"{name} {tf}: deleted {gone} alert(s) whose group was taken")
             print(f"{name} {tf}: {len(chart)} candles, {sum(len(g) == 3 for _, _, g in groups)} 3-star, {sum(len(g) == 2 for _, _, g in groups)} 2-star live")
+    if options_alert and dhan_m5 and dhan_data and dhan_data.enabled():
+        try:
+            sent_any += options_alert.run(dhan_m5, state, now, send_opt, dhan_data.fetch_option, edit_opt)
+        except Exception as e:
+            print(f"options error {e}")
     if conbox_alert:
         try:
             sent_any += conbox_alert.send_status(state, now, send)

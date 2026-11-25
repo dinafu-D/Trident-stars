@@ -52,7 +52,7 @@ def _closed_1h(h1, now):
     return h1[keep]
 
 
-def replay(h1, tick):
+def replay(h1, tick, tf_ms=TF_MS):
     """Walk the closed 1h candles like TRIDENT. Returns every EOB (dicts), oldest first."""
     t = [_ms(x) for x in h1.index]
     O, H, L, C = list(h1["Open"]), list(h1["High"]), list(h1["Low"]), list(h1["Close"])
@@ -94,7 +94,7 @@ def replay(h1, tick):
                     top, bot = bH, (bodyTop if (bH - bodyTop) >= tick else bH - qtr)
                 swp = any(x in (tkH if bear else tkL) for x in (p - 1, p, p + 1))
                 rec = dict(bear=bear, sw=p, swT=t[p], lvl=H[p] if bear else L[p], top=top, bot=bot, boxT=t[bP],
-                           swp=swp, hp=False, hpAt=None, made=k, madeEnd=t[k] + TF_MS, invalid=False)
+                           swp=swp, hp=False, hpAt=None, made=k, madeEnd=t[k] + tf_ms, invalid=False, invAt=None)
                 eobs.append(rec)
                 active.append(rec)
                 if len(active) > 100:
@@ -113,12 +113,12 @@ def replay(h1, tick):
             for c1 in (r["sw"] - 1, r["sw"], r["sw"] - 3, r["sw"] - 2):
                 if c1 >= 0 and c1 + 2 <= k:
                     if (H[c1 + 2] < L[c1]) if r["bear"] else (L[c1 + 2] > H[c1]):
-                        r["hp"], r["hpAt"] = True, t[k] + TF_MS
+                        r["hp"], r["hpAt"] = True, t[k] + tf_ms
                         break
         # (6) invalidation: a close beyond the swing high (red) / low (green), from the candle after the swing
         for r in list(active):
             if k > r["sw"] and ((C[k] > r["lvl"]) if r["bear"] else (C[k] < r["lvl"])):
-                r["invalid"] = True
+                r["invalid"], r["invAt"] = True, t[k] + tf_ms
                 active.remove(r)
     return eobs, active
 

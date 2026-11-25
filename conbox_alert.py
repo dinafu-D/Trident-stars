@@ -489,6 +489,12 @@ def _status_block(name, now):
     return (sig, txt)
 
 
+def order_names(now):
+    """Fri-Tue NIFTY first, Wed-Thu SENSEX first (expiry-day priority)."""
+    wd = pd.Timestamp(now).weekday()          # Mon 0 ... Sun 6
+    return ["SENSEX", "NIFTY"] if wd in (2, 3) else ["NIFTY", "SENSEX"]
+
+
 def send_status(state, now, send):
     """Send ONE combined NIFTY + SENSEX status message when any index's status changed."""
     if not STATUS_ON or not STATUS:
@@ -498,7 +504,7 @@ def send_status(state, now, send):
     if last.get("sig") == sig:
         return 0
     txt = "\n\n".join([f"📦 <b>CON BOX STATUS · {pd.Timestamp(now).strftime('%d %b %H:%M')}</b>"] +
-                       [STATUS[k][1] for k in sorted(STATUS, key=lambda n: (n != "NIFTY", n))])
+                       [STATUS[k][1] for k in order_names(now) if k in STATUS])
     if send(txt):
         last["sig"] = sig
         return 1

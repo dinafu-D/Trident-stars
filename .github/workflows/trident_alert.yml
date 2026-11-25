@@ -42,6 +42,8 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          OPT_TELEGRAM_BOT_TOKEN: ${{ secrets.OPT_TELEGRAM_BOT_TOKEN }}
+          OPT_TELEGRAM_CHAT_ID: ${{ secrets.OPT_TELEGRAM_CHAT_ID }}
           DHAN_CLIENT_ID: ${{ secrets.DHAN_CLIENT_ID }}
           DHAN_PIN: ${{ secrets.DHAN_PIN }}
           DHAN_TOTP_SECRET: ${{ secrets.DHAN_TOTP_SECRET }}
@@ -50,6 +52,8 @@ jobs:
           CB_STATUS: "1"          # combined NIFTY + SENSEX con box status, sent when it changes (0 = off)
           TREND_ALERTS: "0"       # separate trend-change alert off (trend line stays in con box alerts)
           HLLH_ALERTS: "1"        # 5m: 3+ HL / LH in a row, one LL / HH in between allowed (0 = off)
+          OPTION_ALERTS: "1"        # options con box (ATM +-5 CE/PE), sent on break / back inside (0 = off)
+          OPT_EOB_CONFIRM: "1"      # options EOB CONFIRMED, ATM +-2 same strike CE+PE (0 = off)
           EOB_ALERTS: "1"         # 1h EOB alerts with colour: normal / dark / sweep (0 = off)
           SKIP_15M: "1"
           ALERT_2STAR: "0"        # 0 = only complete 3-star groups

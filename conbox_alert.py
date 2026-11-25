@@ -447,7 +447,7 @@ def _status_block(name, now):
         rows = []
         for g in (1.0, 0.75, 0.5, 0.25, 0.0):
             tag = f"{g:g}".ljust(4)
-            mark = f"  ◀ price {c:.2f}" if g == lvl else ""
+            mark = f"  ◀ live price {c:.2f}" if g == lvl else ""
             rows.append(f"{tag} = {lo + rg * g:.2f}{mark}")
         txt = "\n".join([f"<b>{name} 5m · INSIDE CON BOX · at {lvl:g}</b>",
                          "<pre>" + "\n".join(rows) + "</pre>",
@@ -462,7 +462,7 @@ def _status_block(name, now):
     since_i = since_i if 0 <= since_i < len(C) else len(C) - 1
     after = C[since_i:]
     tg = []
-    for m in (1.5, 2.0):
+    for m in (1.5, 2.0, 2.5):
         lv = lo + m * rg if side == 1 else hi - m * rg
         hit = any(v >= lv for v in after) if side == 1 else any(v <= lv for v in after)
         tg.append((m, lv, hit))
@@ -481,10 +481,11 @@ def _status_block(name, now):
         head = f"<b>{name} 5m · NO CON BOX TODAY</b>\nLast box ({first_day:%d %b}): broken {_side_txt(r['brk'])} · {_dur(r)} {lab} · {xm:.2f}x"
     rows = [f"{m:g}x".ljust(4) + f" = {lv:.2f}" + (" ✓" if hit else "") for m, lv, hit in tg]
     txt = "\n".join([f"{emo} {head}",
-                     f"Box {lo:.2f} – {hi:.2f} · broke {'UP' if r['brk1'] == 1 else 'DOWN'} at {brk_t}" + b_txt,
-                     f"Price {c:.2f}",
+                     f"Box {lo:.2f} – {hi:.2f} · broke {'UP' if r['brk1'] == 1 else 'DOWN'} at {brk_t}"
+                     + (f" (close {C[brk_i]:.2f})" if 0 <= brk_i < len(C) else "") + b_txt,
+                     f"Live price (last 5m close): {c:.2f}",
                      "<pre>" + "\n".join(rows) + "</pre>"])
-    sig = f"{name}|BRK|{r['firstT']}|{r['brk']}|{int(tg[0][2])}{int(tg[1][2])}|{first_day == today}"
+    sig = f"{name}|BRK|{r['firstT']}|{r['brk']}|{''.join(str(int(h)) for _, _, h in tg)}|{first_day == today}"
     return (sig, txt)
 
 

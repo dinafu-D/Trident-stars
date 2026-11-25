@@ -10,7 +10,7 @@ EOB rule (same as TRIDENT):
   * invalid = a candle CLOSES beyond the swing candle's high (red) / low (green)  -> alert message deleted
 Colours:
   * sweep  : the swing candle, the candle before or the candle after was the FIRST to take (wick beyond)
-             an older untaken swing on the same side           -> bull YELLOW / bear PURPLE
+             an older untaken swing on the same side           -> bull BLUE / bear PURPLE
   * dark   : a 3-candle FVG in the EOB direction uses the EOB candle or the candle before it as candle 1 or 3
              (known at most 2 candles after the swing)          -> DARK ... ; the alert is edited + a short reply sent
   * normal : GREEN / RED
@@ -33,8 +33,8 @@ COLOURS = {("bull", False, False): ("🟩", "GREEN"),
            ("bull", True, False):  ("🟢", "DARK GREEN"),
            ("bear", False, False): ("🟥", "RED"),
            ("bear", True, False):  ("🔴", "DARK RED"),
-           ("bull", False, True):  ("🟨", "YELLOW"),
-           ("bull", True, True):   ("🟡", "DARK YELLOW"),
+           ("bull", False, True):  ("🟦", "BLUE"),
+           ("bull", True, True):   ("🔵", "DARK BLUE"),
            ("bear", False, True):  ("🟪", "PURPLE"),
            ("bear", True, True):   ("🟣", "DARK PURPLE")}
 

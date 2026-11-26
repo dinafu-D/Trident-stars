@@ -11,10 +11,11 @@ Message : ONLY when a tracked box BREAKS (5m close outside), goes BACK INSIDE (t
           (index UP: CE up / PE down, index DOWN: CE down / PE up), 1.5x / 2x / 2.5x listed vertically.
 Order   : Fri-Tue NIFTY first, Wed-Thu SENSEX first.
 
-EOB CONFIRMED (ATM +-2, same strike): on the SAME 5m candle the CE makes a bull EOB and the PE a bear EOB
-          (both point UP), or CE bear + PE bull (both point DOWN). TRIDENT EOB rules + colours on 5m option
-          candles. One message per check; later edited for a colour change (dark) or ❌ INVALID
-          (either side closes beyond its swing). No index check.
+OPTIONS EOB (ATM +-2, option buying): index 5m con box DOWN -> PE bull EOBs, UP -> CE bull EOBs
+          (index inside / no box -> nothing). Table: Strike · option colour + price · swing time ·
+          CE/PE ✅ if the other option made the opposite (bear) EOB on the same swing candle ·
+          IN ✅ if the index made the same-direction EOB (DOWN: bear) on the same swing candle.
+          One message per check; edited every 5 min (price, dark colour, ticks, ❌ INVALID).
 """
 
 import json
@@ -195,104 +196,111 @@ def _eobs(df, now):
     return eobs
 
 
-def _pairs(ce, pe):
-    """Confirmed pairs: CE bull + PE bear (UP) / CE bear + PE bull (DOWN), same swing candle."""
-    out = []
-    for a in ce:
-        for b in pe:
-            if a["swT"] == b["swT"] and a["bear"] != b["bear"]:
-                out.append(dict(dir=-1 if a["bear"] else 1, ce=a, pe=b))
-    return out
-
-
 def _col(r):
     return EOB.COLOURS[("bear" if r["bear"] else "bull", r["hp"], r["swp"])]
 
 
-def _px(v):
-    return f"{v:.2f}" if v is not None else "–"
+def _hh(ms):
+    return pd.Timestamp(ms, unit="ms", tz=IST).strftime("%H:%M")
 
 
-def _pair_rows(p):
-    """84000  CE 🔴 DARK RED · 09:35 · 255.10  /  PE 🟩 GREEN · 09:35 · 350.75   (or ❌ INVALID)"""
-    ce, pe = p["ce"], p["pe"]
-    (e1, c1), (e2, c2) = _col(ce), _col(pe)
-    k = str(p["k"])
-    pad = " " * (len(k) + 2)
-    sw = pd.Timestamp(ce["swT"], unit="ms", tz=IST).strftime("%H:%M")      # swing candle the EOB formed on
-    if ce["invalid"] or pe["invalid"]:
-        why = []
-        for typ in ("ce", "pe"):
-            r = p[typ]
-            if r["invalid"]:
-                at = pd.Timestamp(r["invAt"], unit="ms", tz=IST).strftime("%H:%M")
-                why.append(f"{typ.upper()} closed {'above' if r['bear'] else 'below'} {r['lvl']:.2f} at {at}")
-        return f"❌ <s>{k}  CE {c1} · PE {c2} · {sw}</s>\n{pad}INVALID · " + " · ".join(why)
-    return (f"<b>{k}</b>  CE {e1} {c1} · {sw} · <b>{_px(p.get('cepx'))}</b>\n"
-            f"{pad}PE {e2} {c2} · {sw} · <b>{_px(p.get('pepx'))}</b>")
+def _idx_eobs(m5, now):
+    """5m EOBs of the index (last ~3 days of closed candles)."""
+    df = m5[[(x + pd.Timedelta(minutes=5)) <= now for x in m5.index]].tail(240)
+    if len(df) < 3 or "Open" not in df:
+        return []
+    eobs, _ = EOB.replay(df, 0.05, tf_ms=5 * 60000)
+    return eobs
 
 
-def _eobc_message(pairs, label, now):
-    """Grouped by index + direction (index order kept); strike rows under each group."""
-    out = ["🔱 <b>OPTIONS · EOB CONFIRMED (5m)</b>"]
+def _row(row, sides, idx_eobs):
+    """Look up the buy-side option's bull EOB + the two same-time checks for a sent/new row."""
+    buy, opp = ("PE", "CE") if row["dir"] == -1 else ("CE", "PE")
+    r = next((e for e in sides.get(buy, []) if not e["bear"] and e["swT"] == row["swT"]), None)
+    if r is None:
+        return None
+    t_opp = any(e["bear"] and e["swT"] == row["swT"] for e in sides.get(opp, []))
+    t_idx = any(e["bear"] == (row["dir"] == -1) and e["swT"] == row["swT"] for e in idx_eobs)
+    return dict(r=r, px=sides.get(buy + "px"), opp=t_opp, idx=t_idx)
+
+
+def _eobc_message(rows, now):
+    """Table per index + direction:  Strike  PE  Time  CE  IN"""
+    out = ["🔱 <b>OPTIONS · EOB</b>"]
     groups = {}
-    for p in pairs:
-        groups.setdefault((p["name"], p["dir"]), []).append(p)
-    for (name, d), ps in groups.items():
-        arrow = "📈 Both point UP ⬆" if d == 1 else "📉 Both point DOWN ⬇"
-        out.append(f"\n<b>{name}</b> · {arrow}")
-        out += [_pair_rows(p) for p in sorted(ps, key=lambda x: (x["ce"]["swT"], x["k"]))]
-    out.append(f"\n<i>Price = last 5m close at {pd.Timestamp(now):%H:%M} (updates every 5 min)</i>")
+    for row in rows:
+        groups.setdefault((row["name"], row["dir"]), []).append(row)
+    for (name, d), rs in groups.items():
+        buy, opp = ("PE", "CE") if d == -1 else ("CE", "PE")
+        head = f"📉 Index DOWN ⬇ → buy PE" if d == -1 else f"📈 Index UP ⬆ → buy CE"
+        lines = [f"{'Strike':<8} {buy:<11} {'Time':<7} {opp:<4} IN"]
+        for row in sorted(rs, key=lambda x: (x["swT"], x["k"])):
+            v = row["v"]
+            k = f"{row['k']:<8}"
+            if v["r"]["invalid"]:
+                lines.append(f"{k} ❌ INVALID · closed below {v['r']['lvl']:.2f} at {_hh(v['r']['invAt'])}")
+                continue
+            emo = _col(v["r"])[0]
+            px = f"{v['px']:.2f}" if v["px"] is not None else "–"
+            lines.append(f"{k} {emo} {px:<8} {_hh(row['swT']):<7} {'✅' if v['opp'] else '❌'}   "
+                         f"{'✅' if v['idx'] else '❌'}")
+        out.append(f"\n<b>{name}</b> · {head}\n<pre>" + "\n".join(lines) + "</pre>")
+    out.append(f"<i>Price = last 5m close at {pd.Timestamp(now):%H:%M} (updates every 5 min)\n"
+               f"Time = swing candle · CE/PE = other option made the opposite EOB at the same time · "
+               f"IN = index made the same-direction EOB at the same time\n"
+               f"🟩 green 🟢 dark green · 🟦 blue 🔵 dark blue</i>")
     return "\n".join(out)
 
 
-def run_eob_confirm(found, state, now, send, edit, names):
-    """found: {name: {strike: {"CE": eobs, "PE": eobs}}} for ATM +-2 (plus strikes of today's sent pairs)."""
+def run_eob_confirm(found, idxinfo, state, now, send, edit, names):
+    """found: {name: {strike: {"new": bool, "CE": eobs, "PE": eobs, "CEpx": .., "PEpx": ..}}}
+    idxinfo: {name: (index direction 1/-1/0, index 5m eobs)}"""
     st = state.setdefault("_eobc", {})
     today = pd.Timestamp(now).strftime("%Y-%m-%d")
-    for mid in [m for m, v in st.items() if v.get("day") != today]:
-        st.pop(mid)                                   # yesterday's messages are no longer updated
+    for mid in [m for m, v in st.items() if v.get("day") != today or "rows" not in v]:
+        st.pop(mid)                                   # yesterday's (or old-format) messages are not updated
     cutoff = CB._ms(now) - WINDOW_MIN * 60000
-    sent_keys = {k for v in st.values() for k in v["keys"]}
+    sent = {f"{r['name']}|{r['k']}|{r['dir']}|{r['swT']}" for v in st.values() for r in v["rows"]}
     new = []
     for name in names:
+        d, idx_eobs = idxinfo.get(name, (0, []))
+        if d == 0:
+            continue                                  # index inside its box / no box -> nothing new
+        buy = "PE" if d == -1 else "CE"
         for k in sorted(found.get(name, {})):
             sides = found[name][k]
             if not sides.get("new"):
                 continue
-            for p in _pairs(sides.get("CE", []), sides.get("PE", [])):
-                key = f"{name}|{k}|{p['ce']['swT']}|{p['dir']}"
-                if key in sent_keys or p["ce"]["invalid"] or p["pe"]["invalid"] or p["ce"]["madeEnd"] < cutoff:
+            for e in sides.get(buy, []):
+                if e["bear"] or e["invalid"] or e["madeEnd"] < cutoff:
                     continue
-                p.update(name=name, k=k, key=key, cepx=sides.get("CEpx"), pepx=sides.get("PEpx"))
-                new.append(p)
+                row = dict(name=name, k=k, dir=d, swT=e["swT"])
+                if f"{name}|{k}|{d}|{e['swT']}" in sent:
+                    continue
+                row["v"] = _row(row, sides, idx_eobs)
+                new.append(row)
     n, just = 0, None
     if new:
-        label = f"{pd.Timestamp(now):%H:%M}"
-        txt = _eobc_message(new, label, now)
+        txt = _eobc_message(new, now)
         mid = send(txt)
         if mid:
             just = str(mid)
-            st[just] = dict(day=today, keys=[p["key"] for p in new], text=txt, label=label)
+            st[just] = dict(day=today, text=txt,
+                            rows=[{k: r[k] for k in ("name", "k", "dir", "swT")} for r in new])
             n = 1
-    # update earlier messages (colour turned dark / a side became invalid)
+    # update earlier messages: price, colour (dark), ticks, invalid
     for mid, v in st.items():
         if mid == just:
             continue
-        pairs = []
-        for key in v["keys"]:
-            name, k, swT, d = key.split("|")
-            sides = found.get(name, {}).get(int(k))
-            if sides is None:
+        rows = []
+        for r in v["rows"]:
+            sides = found.get(r["name"], {}).get(r["k"])
+            vv = _row(r, sides, idxinfo.get(r["name"], (0, []))[1]) if sides else None
+            if vv is None:
                 break
-            match = [p for p in _pairs(sides.get("CE", []), sides.get("PE", []))
-                     if str(p["ce"]["swT"]) == swT and str(p["dir"]) == d]
-            if not match:
-                break
-            match[0].update(name=name, k=int(k), key=key, cepx=sides.get("CEpx"), pepx=sides.get("PEpx"))
-            pairs.append(match[0])
+            rows.append(dict(r, v=vv))
         else:
-            txt = _eobc_message(pairs, v["label"], now)
+            txt = _eobc_message(rows, now)
             if txt != v["text"] and edit and edit(int(mid), txt):
                 v["text"] = txt
     return n
@@ -308,9 +316,9 @@ def run(m5_by_name, state, now, send, fetch_option, edit=None):
     found = {}                                             # EOB confirm: {name: {strike: {"CE": [...], "PE": [...]}}}
     want = {}                                              # strikes of today's sent EOB-confirm pairs (kept updated)
     for v in state.get("_eobc", {}).values():
-        for key in v["keys"]:
-            nm, kk = key.split("|")[:2]
-            want.setdefault(nm, set()).add(int(kk))
+        for r in v.get("rows", []):
+            want.setdefault(r["name"], set()).add(int(r["k"]))
+    idxinfo = {}
     names = order_names(now)
     for name in names:
         if name not in contracts or name not in m5_by_name:
@@ -320,6 +328,11 @@ def run(m5_by_name, state, now, send, fetch_option, edit=None):
         if c is None:
             continue
         idx_dir, idx_line = _index_dir(m5_by_name[name], now)
+        if EOBC_ON:
+            try:
+                idxinfo[name] = (idx_dir, _idx_eobs(m5_by_name[name], now))
+            except Exception as e:
+                print(f"options {name} index EOB: {e}")
         items = []
         strikes = [c + j * step for j in range(-SIDE_N, SIDE_N + 1)]
         eob_new = {c + j * step for j in range(-EOBC_SIDE, EOBC_SIDE + 1)}
@@ -361,7 +374,7 @@ def run(m5_by_name, state, now, send, fetch_option, edit=None):
     eobc = 0
     if EOBC_ON:
         try:
-            eobc = run_eob_confirm(found, state, now, send, edit, names)
+            eobc = run_eob_confirm(found, idxinfo, state, now, send, edit, names)
         except Exception as e:
             print("options EOB confirm error:", e)
     if not blocks:

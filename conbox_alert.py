@@ -9,8 +9,8 @@ Con box = same rules as TRIDENT's chart con boxes (default settings):
   * the box keeps extending until a candle CLOSES outside it: above = U, below = D;
     a later close beyond the other side = B
   * "formed" alert = as soon as the box exists (Min Bars rule removed; CB_MIN_BARS can bring it back)
-  * 1h MTF box = the same engine on 1h candles (09:15-aligned); the 5m price is reported inside / broken
-    with how long it has been inside
+  * 1h MTF box = the same engine on closed 1h candles (09:15-aligned); shown like TRIDENT's label:
+    duration (45m / 3h / 2d) + U / D / B + x move from the latest 5m close
 
 Trend (TRIDENT Market Structure, Structure Timeframe = Chart):
   * UP = last swing high HH and last swing low HL | DOWN = LH and LL | otherwise SIDEWAYS
@@ -379,7 +379,8 @@ def _mins(n5):
 
 
 def mtf_status(m5, now, tick):
-    """Where the latest 5m close is vs the latest 1h MTF con box. None if no 1h box."""
+    """Latest 1h MTF con box, TRIDENT-style: duration text (45m / 3h / 2d) from the 1h candles,
+    break U / D / B on a 1h close, x move from the latest 5m close. None if no 1h box."""
     h = hourly(m5, now)
     if h is None or len(h) < 4:
         return None
@@ -387,49 +388,47 @@ def mtf_status(m5, now, tick):
     try:
         replay(h, tick, tf_min=60)
         recs = [r for r in LAST["recs"] if not r["dead"]]
+        ht = list(LAST["t"])
     finally:
         LAST.clear()
         LAST.update(saved)
     if not recs:
         return None
     r = max(recs, key=lambda x: (x["rightT"], x["firstT"]))
+    closed = m5[[(_ms(x) + TF_MIN * 60000) <= _ms(now) for x in m5.index]]
+    c = float(closed["Close"].iloc[-1])
     hi, lo = r["hi"], r["lo"]
     rg = (hi - lo) or 1e-9
-    df = m5[[(_ms(x) + TF_MIN * 60000) <= _ms(now) and _ms(x) >= r["firstT"] for x in m5.index]]
-    C, T = list(df["Close"]), [_ms(x) for x in df.index]
-    if not C:
-        return None
-    side, run_in, last_in, brk_t, brk_side = None, 0, 0, None, 0
-    for c, t in zip(C, T):
-        sd = 1 if c > hi else -1 if c < lo else 0
-        if sd == 0:
-            run_in = run_in + 1 if side == 0 else 1
-        elif side == 0 or side is None or sd != side:
-            if side == 0:
-                last_in = run_in
-            brk_t, brk_side = t + TF_MIN * 60000, sd
-        side = sd
-    c = C[-1]
-    return dict(hi=hi, lo=lo, firstT=r["firstT"], side=side, run_in=run_in, last_in=last_in,
-                brk_t=brk_t, brk_side=brk_side, close=c,
-                x=(c - lo) / rg if side == 1 else (hi - c) / rg if side == -1 else (c - lo) / rg)
+    side = 0 if r["live"] else (r["brk"] if r["brk"] in (1, -1) else -r["brk1"])
+    x = (c - lo) / rg if side >= 0 else (hi - c) / rg
+    bi = r.get("bIdx", -1) if r["brk"] == 2 else r.get("brkIdx", -1)
+    brk_t = None
+    if 0 <= bi < len(ht):                                   # close time of the 1h candle (last one ends 15:30)
+        st = pd.Timestamp(ht[bi], unit="ms", tz=IST)
+        brk_t = _ms(min(st + pd.Timedelta(hours=1), st.normalize() + pd.Timedelta(hours=15, minutes=30)))
+    return dict(hi=hi, lo=lo, firstT=r["firstT"], live=r["live"], brk=r["brk"], side=side, x=x,
+                dur=_dur(r, 60), brk_t=brk_t, close=c)
 
 
 def mtf_line(st, now):
-    """📦 1h box 24500.00–24620.00 · inside at 0.5 · 1h20m  |  · broke UP ⬆ 11:20 after 2h05m inside · 1.30x"""
+    """📦 1h box 24500.00–24620.00 · 3h · inside at 0.5   |   📦 1h box ... · 3h U 1.30x · broke 11:15"""
     if not st:
         return "📦 1h box: none"
     d = pd.Timestamp(st["firstT"], unit="ms", tz=IST)
     old = f" ({d:%d %b})" if d.date() != pd.Timestamp(now).date() else ""
     box = f"📦 1h box{old} {st['lo']:.2f}–{st['hi']:.2f}"
-    if st["side"] == 0:
+    if st["live"]:
         x = st["x"]
         lvl = 1.0 if x >= 1 else 0.75 if x >= 0.75 else 0.5 if x >= 0.5 else 0.25 if x >= 0.25 else 0.0
-        return f"{box} · inside at {lvl:g} · {_mins(st['run_in'])} inside"
-    when = pd.Timestamp(st["brk_t"], unit="ms", tz=IST).strftime("%H:%M") if st["brk_t"] else "-"
-    after = f" after {_mins(st['last_in'])} inside" if st["last_in"] else ""
-    return f"{box} · broke {'UP ⬆' if st['side'] == 1 else 'DOWN ⬇'} {when}{after} · {st['x']:.2f}x"
-
+        where = f"inside at {lvl:g}" if st["lo"] <= st["close"] <= st["hi"] else \
+            f"5m {'above' if st['close'] > st['hi'] else 'below'} box (1h not closed out)"
+        return f"{box} · {st['dur']} · {where}"
+    lab = "U" if st["brk"] == 1 else "D" if st["brk"] == -1 else "B"
+    when = ""
+    if st["brk_t"]:
+        bt = pd.Timestamp(st["brk_t"], unit="ms", tz=IST)
+        when = f" · broke {bt:%H:%M}" if bt.date() == pd.Timestamp(now).date() else f" · broke {bt:%d %b %H:%M}"
+    return f"{box} · {st['dur']} {lab} {st['x']:.2f}x{when}"
 
 # ───────────────────────── messages ─────────────────────────
 def _fmt_t(ms):
@@ -579,7 +578,19 @@ def _status_core(name, now):
 
 
 def order_names(now):
-    """Fri-Tue NIFTY first, Wed-Thu SENSEX first (expiry-day priority)."""
+    """Index with the NEAREST option expiry first (expiry day -> that index on top); same expiry -> NIFTY first.
+    Uses the options contract list (state/opt_contracts.json); falls back to Wed-Thu SENSEX first."""
+    import json
+    today = pd.Timestamp(now).strftime("%Y-%m-%d")
+    try:
+        f = os.path.join(os.path.dirname(os.getenv("STATE_FILE", "state/sent_stars.json")) or ".", "opt_contracts.json")
+        with open(f) as fh:
+            c = json.load(fh)
+        exp = {k: v["expiry"] for k, v in c["data"].items()}
+        if c.get("date") == today and "NIFTY" in exp and "SENSEX" in exp:
+            return sorted(["NIFTY", "SENSEX"], key=lambda k: (exp[k], k != "NIFTY"))
+    except Exception:
+        pass
     wd = pd.Timestamp(now).weekday()          # Mon 0 ... Sun 6
     return ["SENSEX", "NIFTY"] if wd in (2, 3) else ["NIFTY", "SENSEX"]
 

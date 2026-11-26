@@ -5,9 +5,9 @@ CON BOX : ATM +-2 (ATM recalculated every 5 min from the index spot), buy side o
           (index DOWN -> PE, UP -> CE; index inside / no box -> CE + PE). Nearest weekly expiry
           (the expiring contract on expiry day). One BOARD message per index, edited silently every 5 min:
           latest box today (or the last old box), time in box, break side / time, x move, 1.5x / 2x / 2.5x,
-          back inside, and the option's own 1h MTF box (inside at level + time inside / broke + time).
+          back inside, and the option's own 1h MTF box (TRIDENT label: duration, U/D/B, x, break time).
           A NEW message (with sound) when a box forms, breaks, goes back inside or breaks again.
-Order   : Fri-Tue NIFTY first, Wed-Thu SENSEX first.
+Order   : index with the nearest option expiry first (expiry day -> on top); same expiry -> NIFTY first.
 
 OPTIONS EOB (ATM +-2, option buying): index 5m con box DOWN -> PE bull EOBs, UP -> CE bull EOBs
           (index inside / no box -> nothing). Table: Strike · option colour + price · swing time ·
@@ -37,7 +37,7 @@ SCRIP_MASTER = "https://images.dhan.co/api-data/api-scrip-master.csv"
 
 
 def order_names(now):
-    """Fri-Tue NIFTY first, Wed-Thu SENSEX first."""
+    """Nearest option expiry first (see conbox_alert.order_names)."""
     return CB.order_names(now)
 
 
@@ -196,12 +196,12 @@ def _board_strike(k, typ, df, now):
         x = (price - lo) / rg
         lvl = 1.0 if x >= 1 else 0.75 if x >= 0.75 else 0.5 if x >= 0.5 else 0.25 if x >= 0.25 else 0.0
         lines.append(f"  {'🆕 ' if tb else ''}{old} {lo:.2f}–{hi:.2f} · from {_hm2(r['firstT'], now)} "
-                     f"({CB._mins(bars)}) · inside at {lvl:g}")
+                     f"({CB._dur(r)}) · inside at {lvl:g}")
     else:
         bi = r.get("brkIdx", -1)
         bi = bi if 0 <= bi < len(C) else len(C) - 1
         lines.append(f"  {old} {lo:.2f}–{hi:.2f} · {_hm2(r['firstT'], now)}→{_hm2(t[bi] + 300000, now)} "
-                     f"({CB._mins(bars)} in box)")
+                     f"({CB._dur(r)} in box)")
         # side now: walk closes after the first break (break / back inside / break again)
         sd_now, since = 0, bi
         for j in range(bi, len(C)):

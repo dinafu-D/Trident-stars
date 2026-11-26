@@ -8,7 +8,9 @@ Con box = same rules as TRIDENT's chart con boxes (default settings):
   * overlapping / touching boxes merge into one
   * the box keeps extending until a candle CLOSES outside it: above = U, below = D;
     a later close beyond the other side = B
-  * "formed" alert = when the box shows its label on TRIDENT ("Min Bars" = 9 candles, i.e. 45 min on 5m)
+  * "formed" alert = as soon as the box exists (Min Bars rule removed; CB_MIN_BARS can bring it back)
+  * 1h MTF box = the same engine on 1h candles (09:15-aligned); the 5m price is reported inside / broken
+    with how long it has been inside
 
 Trend (TRIDENT Market Structure, Structure Timeframe = Chart):
   * UP = last swing high HH and last swing low HL | DOWN = LH and LL | otherwise SIDEWAYS
@@ -21,7 +23,8 @@ import pandas as pd
 
 IST = "Asia/Kolkata"
 TF_MIN = 5
-MIN_BARS = int(os.getenv("CB_MIN_BARS", "9"))          # TRIDENT "Min Bars To Show Duration Text"
+MIN_BARS = int(os.getenv("CB_MIN_BARS", "1"))          # 1 = every box (TRIDENT label rule was 9)
+MTF_ON = os.getenv("CB_MTF_1H", "1") == "1"            # 1h MTF box line in con box alerts / status
 GAP_MAX = 4                                             # next swing within 4 candles
 ATR_LEN, ATR_MULT = 5, 2.5
 EMA_LEN = int(os.getenv("EMA_LEN", "6"))
@@ -35,6 +38,7 @@ TICK = {"NIFTY": 0.05, "SENSEX": 0.01}
 
 LAST = {}          # last replay: boxes + closes (for the status message)
 STATUS = {}        # per index: (signature, text) for the combined status message
+MTF = {}           # per index: current 1h MTF box line
 STATUS_ON = os.getenv("CB_STATUS", "1") == "1"
 
 
@@ -77,11 +81,11 @@ def _sessions(t1, t2):
     return max(1, sum(1 for d in pd.date_range(d1, d2, freq="D") if d.weekday() < 5))
 
 
-def _dur(rec):
+def _dur(rec, tf_min=TF_MIN):
     """TRIDENT box text: 45m / 1.5h / 2d"""
     bars = rec["rightIdx"] - rec["leftIdx"] + 1
     ss = _sessions(rec["firstT"], rec["rightT"])
-    mins = bars * TF_MIN
+    mins = bars * tf_min
     if ss > 1:
         return f"{ss}d"
     if mins < 60:
@@ -91,17 +95,17 @@ def _dur(rec):
 
 
 # ───────────────────────── replay ─────────────────────────
-def replay(m5, tick):
-    """Walk the closed 5m candles like TRIDENT. Returns a list of events (oldest first)."""
+def replay(m5, tick, tf_min=TF_MIN):
+    """Walk the closed candles like TRIDENT. Returns a list of events (oldest first)."""
     t = [_ms(x) for x in m5.index]
     t_idx = {x: k for k, x in enumerate(t)}
-    end = [x + TF_MIN * 60000 for x in t]
+    end = [x + tf_min * 60000 for x in t]
     H, L, C = list(m5["High"]), list(m5["Low"]), list(m5["Close"])
     n = len(C)
     dayEnd = [_ms(pd.Timestamp(x).normalize() + pd.Timedelta(hours=15, minutes=30)) for x in m5.index]
     atr = _atr(H, L, C, ATR_LEN)
     ema = _ema(C, EMA_LEN)
-    tolT, tolP = 1 * TF_MIN * 60000, tick
+    tolT, tolP = 1 * tf_min * 60000, tick
 
     recs = []
     cAct = cStopped = False
@@ -319,7 +323,7 @@ def replay(m5, tick):
             bars = r["rightIdx"] - r["leftIdx"] + 1
             if bars < MIN_BARS:
                 continue
-            snap = dict(hi=r["hi"], lo=r["lo"], firstT=r["firstT"], dur=_dur(r))
+            snap = dict(hi=r["hi"], lo=r["lo"], firstT=r["firstT"], dur=_dur(r, tf_min))
             if r["id"] not in fm_ids:
                 fm_ids.add(r["id"])
                 events.append(dict(kind="F", end=end[i], key=f"F|{r['firstT']}", box=snap, trend=trend, close=close))
@@ -336,7 +340,7 @@ def replay(m5, tick):
                     zlo, zhi = max(o["lo"], r["lo"]), min(o["hi"], r["hi"])
                     if zlo <= zhi:
                         ovl.append(dict(hi=o["hi"], lo=o["lo"], firstT=o["firstT"], rightT=o["rightT"],
-                                        brk=o["brk"], brk1=o["brk1"], dur=_dur(o), zlo=zlo, zhi=zhi))
+                                        brk=o["brk"], brk1=o["brk1"], dur=_dur(o, tf_min), zlo=zlo, zhi=zhi))
                 if ovl:
                     events.append(dict(kind="O", end=end[i], key=f"O|{r['firstT']}", box=snap, ovl=ovl,
                                        trend=trend, close=close))
@@ -349,6 +353,82 @@ def replay(m5, tick):
                                        trend=trend, close=close))
     LAST.update(recs=recs, C=C, t=t, end=end)          # final state, used by the status message
     return events
+
+
+# ───────────────────────── 1h MTF box (same engine on 1h candles) ─────────────────────────
+def hourly(m5, now):
+    """Closed 1h candles from 5m, NSE/BSE alignment 09:15, 10:15 ... 15:15 (last one ends 15:30)."""
+    if m5 is None or len(m5) == 0:
+        return m5
+    df = m5[[(_ms(x) + TF_MIN * 60000) <= _ms(now) for x in m5.index]]
+    starts = []
+    for x in df.index:
+        base = x.normalize() + pd.Timedelta(hours=9, minutes=15)
+        starts.append(base + pd.Timedelta(hours=int((x - base) // pd.Timedelta(hours=1))))
+    g = df.groupby(starts)
+    h = pd.DataFrame({"Open": g["Open"].first() if "Open" in df else g["Close"].first(),
+                      "High": g["High"].max(), "Low": g["Low"].min(), "Close": g["Close"].last()})
+    ends = [min(x + pd.Timedelta(hours=1), x.normalize() + pd.Timedelta(hours=15, minutes=30)) for x in h.index]
+    return h[[e <= pd.Timestamp(now) for e in ends]]
+
+
+def _mins(n5):
+    """number of 5m candles -> 45m / 1h20m"""
+    m = int(n5) * TF_MIN
+    return f"{m // 60}h{m % 60:02d}m" if m >= 60 else f"{m}m"
+
+
+def mtf_status(m5, now, tick):
+    """Where the latest 5m close is vs the latest 1h MTF con box. None if no 1h box."""
+    h = hourly(m5, now)
+    if h is None or len(h) < 4:
+        return None
+    saved = dict(LAST)
+    try:
+        replay(h, tick, tf_min=60)
+        recs = [r for r in LAST["recs"] if not r["dead"]]
+    finally:
+        LAST.clear()
+        LAST.update(saved)
+    if not recs:
+        return None
+    r = max(recs, key=lambda x: (x["rightT"], x["firstT"]))
+    hi, lo = r["hi"], r["lo"]
+    rg = (hi - lo) or 1e-9
+    df = m5[[(_ms(x) + TF_MIN * 60000) <= _ms(now) and _ms(x) >= r["firstT"] for x in m5.index]]
+    C, T = list(df["Close"]), [_ms(x) for x in df.index]
+    if not C:
+        return None
+    side, run_in, last_in, brk_t, brk_side = None, 0, 0, None, 0
+    for c, t in zip(C, T):
+        sd = 1 if c > hi else -1 if c < lo else 0
+        if sd == 0:
+            run_in = run_in + 1 if side == 0 else 1
+        elif side == 0 or side is None or sd != side:
+            if side == 0:
+                last_in = run_in
+            brk_t, brk_side = t + TF_MIN * 60000, sd
+        side = sd
+    c = C[-1]
+    return dict(hi=hi, lo=lo, firstT=r["firstT"], side=side, run_in=run_in, last_in=last_in,
+                brk_t=brk_t, brk_side=brk_side, close=c,
+                x=(c - lo) / rg if side == 1 else (hi - c) / rg if side == -1 else (c - lo) / rg)
+
+
+def mtf_line(st, now):
+    """📦 1h box 24500.00–24620.00 · inside at 0.5 · 1h20m  |  · broke UP ⬆ 11:20 after 2h05m inside · 1.30x"""
+    if not st:
+        return "📦 1h box: none"
+    d = pd.Timestamp(st["firstT"], unit="ms", tz=IST)
+    old = f" ({d:%d %b})" if d.date() != pd.Timestamp(now).date() else ""
+    box = f"📦 1h box{old} {st['lo']:.2f}–{st['hi']:.2f}"
+    if st["side"] == 0:
+        x = st["x"]
+        lvl = 1.0 if x >= 1 else 0.75 if x >= 0.75 else 0.5 if x >= 0.5 else 0.25 if x >= 0.25 else 0.0
+        return f"{box} · inside at {lvl:g} · {_mins(st['run_in'])} inside"
+    when = pd.Timestamp(st["brk_t"], unit="ms", tz=IST).strftime("%H:%M") if st["brk_t"] else "-"
+    after = f" after {_mins(st['last_in'])} inside" if st["last_in"] else ""
+    return f"{box} · broke {'UP ⬆' if st['side'] == 1 else 'DOWN ⬇'} {when}{after} · {st['x']:.2f}x"
 
 
 # ───────────────────────── messages ─────────────────────────
@@ -390,6 +470,7 @@ def _chain_message(name, ev):
 
 
 def message(name, ev):
+    """Index 5m alerts; con box alerts carry the 1h MTF box line."""
     if ev["kind"] in ("HL", "LH"):
         return _chain_message(name, ev)
     if ev["kind"] == "O":
@@ -415,7 +496,8 @@ def message(name, ev):
                 "D": f"🔴 <b>{name} 5m · CON BOX BROKEN DOWN ⬇</b>",
                 "B": f"🟣 <b>{name} 5m · CON BOX BROKEN BOTH SIDES</b>"}[ev["kind"]]
         lines = [head, f"{box} · lasted {b['dur']}", f"Closed at {ev['close']:.2f} · {when}"]
-    return "\n".join(lines + [_trend_line(tr)])
+    extra = [MTF[name]] if (MTF_ON and MTF.get(name)) else []
+    return "\n".join(lines + extra + [_trend_line(tr)])
 
 
 # ───────────────────────── live con box status (one combined message, sent only on change) ─────────────────────────
@@ -429,7 +511,14 @@ def _hm(ms, with_date=False):
 
 
 def _status_block(name, now):
-    """(signature, text) for one index, from the last replay."""
+    """(signature, text) for one index, from the last replay (+ the 1h MTF box line)."""
+    sig, txt = _status_core(name, now)
+    if MTF_ON and MTF.get(name):
+        txt += "\n" + MTF[name]
+    return sig, txt
+
+
+def _status_core(name, now):
     recs, C, t = LAST.get("recs") or [], LAST.get("C") or [], LAST.get("t") or []
     boxes = [r for r in recs if not r["dead"] and r["rightIdx"] - r["leftIdx"] + 1 >= MIN_BARS]
     if not boxes or not C:
@@ -495,18 +584,24 @@ def order_names(now):
     return ["SENSEX", "NIFTY"] if wd in (2, 3) else ["NIFTY", "SENSEX"]
 
 
-def send_status(state, now, send):
-    """Send ONE combined NIFTY + SENSEX status message when any index's status changed."""
+def send_status(state, now, send, edit=None):
+    """ONE combined NIFTY + SENSEX status message: a NEW message when any index's status changed;
+    otherwise the last one is edited (silent) every 5 min with the live price / 1h box line."""
     if not STATUS_ON or not STATUS:
         return 0
     sig = " || ".join(STATUS[k][0] for k in sorted(STATUS))
     last = state.setdefault("_cbstat", {})
-    if last.get("sig") == sig:
-        return 0
     txt = "\n\n".join([f"📦 <b>CON BOX STATUS · {pd.Timestamp(now).strftime('%d %b %H:%M')}</b>"] +
                        [STATUS[k][1] for k in order_names(now) if k in STATUS])
-    if send(txt):
-        last["sig"] = sig
+    today = pd.Timestamp(now).strftime("%Y-%m-%d")
+    if last.get("sig") == sig:
+        mid = last.get("mid")
+        if edit and mid and last.get("day") == today and last.get("text") != txt and edit(mid, txt):
+            last["text"] = txt
+        return 0
+    mid = send(txt)
+    if mid:
+        last.update(sig=sig, mid=mid if isinstance(mid, int) and mid > 0 else None, day=today, text=txt)
         return 1
     return 0
 
@@ -530,6 +625,12 @@ def run(name, m5, state, now, send):
     closed = m5[[(_ms(x) + TF_MIN * 60000) <= _ms(now) for x in m5.index]]
     if len(closed) < 10:
         return 0
+    if MTF_ON:
+        try:
+            MTF[name] = mtf_line(mtf_status(closed, now, TICK.get(name, 0.05)), now)
+        except Exception as e:
+            print(f"{name} 1h MTF box error {e}")
+            MTF.pop(name, None)
     events = replay(closed, TICK.get(name, 0.05))
     if STATUS_ON:
         STATUS[name] = _status_block(name, now)
@@ -550,5 +651,6 @@ def run(name, m5, state, now, send):
             state[skey] = now.isoformat()
             sent += 1
     print(f"{name} 5m con box / HL-LH: {sum(e['kind'] == 'F' for e in events)} boxes, "
-          f"{sum(e['kind'] in ('HL', 'LH') for e in events)} HL/LH chain alerts in history, sent {sent}")
+          f"{sum(e['kind'] in ('HL', 'LH') for e in events)} HL/LH chain alerts in history, sent {sent}"
+          + (f" | {MTF[name]}" if MTF.get(name) else ""))
     return sent

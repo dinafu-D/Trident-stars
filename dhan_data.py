@@ -144,11 +144,12 @@ def _intraday(sec_id, interval, start, end):
 
 
 def fetch_option(seg, sec_id, now):
-    """Today's 5m candles of one option contract (NSE_FNO / BSE_FNO, OPTIDX)."""
+    """Last ~7 days of 5m candles of one option contract (NSE_FNO / BSE_FNO, OPTIDX):
+    today for the con box / EOB, earlier days for the old box and the 1h MTF box."""
     today = pd.Timestamp(now).normalize().tz_localize(None)
     j = _post("/charts/intraday", {
         "securityId": str(sec_id), "exchangeSegment": seg, "instrument": "OPTIDX", "interval": "5",
-        "oi": False, "fromDate": today.strftime("%Y-%m-%d 09:00:00"),
+        "oi": False, "fromDate": (today - pd.Timedelta(days=7)).strftime("%Y-%m-%d 09:00:00"),
         "toDate": (today + pd.Timedelta(days=1)).strftime("%Y-%m-%d 00:00:00")})
     return _session(_frame(j))
 

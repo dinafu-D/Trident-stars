@@ -52,7 +52,7 @@ except ImportError:             # other bots (Global stars / laptop) don't have 
 # ───────────────────────── SETTINGS ─────────────────────────
 SYMBOLS = {"NIFTY": "^NSEI", "SENSEX": "^BSESN"}
 # chart timeframes to watch (comma list in env CHART_TFS, e.g. "5m,15m")
-CHART_TFS = [t.strip() for t in os.getenv("CHART_TFS", "1h").split(",") if t.strip()]
+CHART_TFS = [t.strip() for t in os.getenv("CHART_TFS", "").split(",") if t.strip()]   # "" = star alerts OFF
 SKIP_15M = os.getenv("SKIP_15M", "1") == "1"   # TRIDENT default: ON (only 1h / 4h / 1D start a group)
 PIVOT_LEN = 1                                  # TRIDENT "Swing Left/Right Candles"
 PIV_CAP = 20                                   # TRIDENT swingTFLookback
@@ -517,7 +517,7 @@ def main():
             print(f"options error {e}")
     if conbox_alert:
         try:
-            sent_any += conbox_alert.send_status(state, now, send)
+            sent_any += conbox_alert.send_status(state, now, send, edit_msg)
         except Exception as e:
             print(f"con box status error {e}")
     if data_errors:

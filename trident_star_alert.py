@@ -431,7 +431,19 @@ def main():
     sent_any = 0
     data_errors = []
     dhan_m5 = {}                # index 5m candles from Dhan (for the options table)
+    active = None
+    if os.getenv("ONE_INDEX", "1") == "1" and conbox_alert:
+        # only the index with the nearest option expiry (expiry day -> that index); all features, both bots
+        try:
+            if options_alert:
+                options_alert.load_contracts(now)
+        except Exception as e:
+            print(f"contract list error {e} (using the weekday rule)")
+        active = conbox_alert.order_names(now)[0]
+        print(f"active index (nearest expiry): {active}")
     for name, ticker in SYMBOLS.items():
+        if active and name != active:
+            continue
         want_h1 = any(t in ("1h", "4h") for t in CHART_TFS) or bool(eob_alert and eob_alert.EOB_ON)
         src = "Dhan"
         try:

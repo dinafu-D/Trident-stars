@@ -1,7 +1,7 @@
 """
 Options con box table (TRIDENT 5m con box on each option chart) -> Telegram, NIFTY + SENSEX, Dhan data only.
 
-CON BOX : ATM +-2 (ATM recalculated every 5 min from the index spot), buy side only
+CON BOX : ATM +-2, 5 strikes (ATM recalculated every 5 min from the index spot), buy side only
           (index DOWN -> PE, UP -> CE; index inside / no box -> CE + PE). Nearest weekly expiry
           (the expiring contract on expiry day). One BOARD message per index, edited silently every 5 min:
           latest box today (or the last old box), time in box, break side / time, x move, 1.5x / 2x / 2.5x,
@@ -28,11 +28,11 @@ import eob_alert as EOB
 IST = "Asia/Kolkata"
 OPT_ON = os.getenv("OPTION_ALERTS", "1") == "1"
 WINDOW_MIN = int(os.getenv("OPT_WINDOW_MIN", "20"))
-SIDE_N = int(os.getenv("OPT_STRIKES_EACH_SIDE", "2"))  # con box board: strikes each side of the ATM
+SIDE_N = int(os.getenv("OPT_STRIKES_EACH_SIDE", "2"))  # con box board: ATM +-2 = 5 strikes
 CFG = {"NIFTY": dict(exch="NSE", seg="NSE_FNO", prefix="NIFTY-", step=50),
        "SENSEX": dict(exch="BSE", seg="BSE_FNO", prefix="SENSEX-", step=100)}
 EOBC_ON = os.getenv("OPT_EOB_CONFIRM", "1") == "1"
-EOBC_SIDE = int(os.getenv("OPT_EOB_STRIKES_EACH_SIDE", "2"))   # ATM +-2
+EOBC_SIDE = int(os.getenv("OPT_EOB_STRIKES_EACH_SIDE", "2"))   # ATM +-2 = 5 strikes
 SCRIP_MASTER = "https://images.dhan.co/api-data/api-scrip-master.csv"
 
 
@@ -167,78 +167,64 @@ def _fibs(lo, hi, side, after):
     return out
 
 
-def _board_strike(k, typ, df, now):
-    """(board text, 1h box line) for one option: latest box today, else the last old box."""
+def _board_strike(k, typ, df, now, both=False):
+    """(table row, short 1h text) for one option: latest box today, else the last old box (marked *)."""
+    tag = f"{k}{typ[0]}" if both else str(k)
     dfc = df[[(x + pd.Timedelta(minutes=5)) <= now for x in df.index]]
     if len(dfc) < 3:
-        return f"<b>{k} {typ}</b> · no data yet", ""
+        return f"{tag:<7}no data", "—"
     CB.replay(dfc, 0.05)
     recs, C, t = CB.LAST["recs"], CB.LAST["C"], CB.LAST["t"]
     price = C[-1]
-    mtf = ""
+    m1 = "—"
     try:
-        mtf = CB.mtf_line(CB.mtf_status(dfc, now, 0.05), now)
+        m1 = CB.mtf_short(CB.mtf_status(dfc, now, 0.05))
     except Exception as e:
         print(f"options {k}{typ} 1h box: {e}")
-    head = f"<b>{k} {typ}</b> · {price:.2f}"
     live = [r for r in recs if not r["dead"]]
     if not live:
-        return "\n".join([head, "  no con box yet"] + ([f"  {mtf}"] if mtf else [])), mtf
+        return f"{tag:<7}{price:<8.1f}{'none':<9}{'—':<6}{m1}", m1
     today = pd.Timestamp(now).date()
     tb = [r for r in live if pd.Timestamp(r["firstT"], unit="ms", tz=IST).date() == today]
     r = max(tb, key=lambda x: x["firstT"]) if tb else max(live, key=lambda x: (x["rightT"], x["firstT"]))
     hi, lo = r["hi"], r["lo"]
     rg = (hi - lo) or 1e-9
-    bars = r["rightIdx"] - r["leftIdx"] + 1
-    old = "Box" if tb else f"Old box ({pd.Timestamp(r['firstT'], unit='ms', tz=IST):%d %b})"
-    lines = [head]
+    star = "" if tb else "*"
+    xs = "—"
     if r["live"]:
         x = (price - lo) / rg
         lvl = 1.0 if x >= 1 else 0.75 if x >= 0.75 else 0.5 if x >= 0.5 else 0.25 if x >= 0.25 else 0.0
-        lines.append(f"  {'🆕 ' if tb else ''}{old} {lo:.2f}–{hi:.2f} · from {_hm2(r['firstT'], now)} "
-                     f"({CB._dur(r)}) · inside at {lvl:g}")
+        box = f"{'🆕' if tb else ''}in{lvl:g}{star}"
     else:
         bi = r.get("brkIdx", -1)
         bi = bi if 0 <= bi < len(C) else len(C) - 1
-        lines.append(f"  {old} {lo:.2f}–{hi:.2f} · {_hm2(r['firstT'], now)}→{_hm2(t[bi] + 300000, now)} "
-                     f"({CB._dur(r)} in box)")
-        # side now: walk closes after the first break (break / back inside / break again)
-        sd_now, since = 0, bi
+        sd_now = 0
         for j in range(bi, len(C)):
-            sd = 1 if C[j] > hi else -1 if C[j] < lo else 0
-            if sd != sd_now:
-                sd_now, since = sd, j
-        first = r["brk1"] if r["brk1"] in (1, -1) else (1 if C[bi] > hi else -1)
-        b1 = f"{'⬆ BROKE UP' if first == 1 else '⬇ BROKE DOWN'} {_hm2(t[bi] + 300000, now)}"
+            sd_now = 1 if C[j] > hi else -1 if C[j] < lo else 0
         if sd_now == 0:
-            lines.append(f"  {b1} · ↩ back inside since {_hm2(t[since] + 300000, now)}")
+            box = f"↩in{star}"
         else:
-            xm = (price - lo) / rg if sd_now == 1 else (hi - price) / rg
-            again = "" if sd_now == first and since == bi else \
-                f" · now {'UP ⬆' if sd_now == 1 else 'DOWN ⬇'} since {_hm2(t[since] + 300000, now)}"
-            lines.append(f"  {b1}{again} · {xm:.2f}x")
-            fb = _fibs(lo, hi, sd_now, C[since:])
-            lines.append("  " + " · ".join(f"{m:g}x {lv:.2f}" + (" ✓" if h else "") for m, lv, h in fb))
-    if mtf:
-        lines.append(f"  {mtf}")
-    return "\n".join(lines), mtf
+            box = f"{'⬆' if sd_now == 1 else '⬇'}{CB._dur(r)}{star}"
+            xs = f"{((price - lo) / rg if sd_now == 1 else (hi - price) / rg):.1f}x"
+    return f"{tag:<7}{price:<8.1f}{box:<9}{xs:<6}{m1}", m1
 
 
-def _sound_text(k, typ, ev, price, mtf, now):
-    """Short alert (new message, with sound) for NEW box / BRK / IN."""
+def _f(v):
+    return f"{v:.0f}" if abs(v) >= 1000 else f"{v:.1f}"
+
+
+def _sound_text(k, typ, ev, price, m1, now):
+    """Compact alert (new message, with sound) for NEW box / BRK / IN."""
     hh = _hm2(ev["end"], now)
-    box = f"Box {ev['lo']:.2f}–{ev['hi']:.2f}"
+    box = f"{_f(ev['lo'])}–{_f(ev['hi'])}"
     if ev["kind"] == "NEW":
-        out = f"🆕 <b>{k} {typ} · NEW CON BOX {hh}</b> · {price:.2f}\n{box}"
-    elif ev["kind"] == "IN":
-        out = f"↩ <b>{k} {typ} · BACK INSIDE {hh}</b> · {price:.2f}\n{box}"
-    else:
-        sd = ev["side"]
-        rows = [f"{m:g}x".ljust(4) + f" = {lv:.2f}" + (" ✓" if h else "")
-                for m, lv, h in _fibs(ev["lo"], ev["hi"], sd, ev["after"])]
-        out = (f"{'⬆' if sd == 1 else '⬇'} <b>{k} {typ} · BROKE {'UP' if sd == 1 else 'DOWN'} {hh}</b> · {price:.2f}\n"
-               f"{box}\n<pre>" + "\n".join(rows) + "</pre>")
-    return out + (f"\n{mtf}" if mtf else "")
+        return f"🆕 <b>{k} {typ} · NEW BOX {hh}</b> · {price:.2f} · {box}"
+    if ev["kind"] == "IN":
+        return f"↩ <b>{k} {typ} · BACK INSIDE {hh}</b> · {price:.2f}"
+    sd = ev["side"]
+    tg = " / ".join(_f(lv) + (" ✓" if h else "") for _, lv, h in _fibs(ev["lo"], ev["hi"], sd, ev["after"]))
+    return (f"{'⬆' if sd == 1 else '⬇'} <b>{k} {typ} · BROKE {'UP' if sd == 1 else 'DOWN'} {hh}</b> · {price:.2f}\n"
+            f"Box {box} · T {tg} · 1h: {m1}")
 
 
 def _post_board(state, name, txt, now, send, edit):
@@ -425,7 +411,7 @@ def run(m5_by_name, state, now, send, fetch_option, edit=None):
                         slot[typ + "px"] = float(dc["Close"].iloc[-1]) if len(dc) else None
                     if k not in strikes or typ not in buy:
                         continue
-                    btxt, mtf = _board_strike(k, typ, df, now)
+                    btxt, mtf = _board_strike(k, typ, df, now, both=len(buy) == 2)
                     board.append(btxt)
                     price, evs = _track(df, now)
                 except Exception as e:
@@ -438,9 +424,11 @@ def run(m5_by_name, state, now, send, fetch_option, edit=None):
                     snd.append(_sound_text(k, typ, ev, price, mtf, now))
                     keys.append(skey)
         exp = pd.Timestamp(contracts[name]["expiry"]).strftime("%d %b")
-        side_txt = "Index DOWN ⬇ → PE" if idx_dir == -1 else "Index UP ⬆ → CE" if idx_dir == 1 else "Index inside / no box → CE + PE"
-        head = f"📊 <b>{name} OPTIONS · CON BOX</b> · {pd.Timestamp(now):%H:%M} · exp {exp}\nATM {atm} · {side_txt}"
-        txt = head + "\n" + idx_line + "\n\n" + "\n\n".join(board)
+        side_txt = "Index DOWN ⬇ → PE" if idx_dir == -1 else "Index UP ⬆ → CE" if idx_dir == 1 else "Index inside box → CE + PE"
+        head = f"📊 <b>{name} OPTIONS</b> · {pd.Timestamp(now):%H:%M} · exp {exp}\nATM {atm} · {side_txt}"
+        table = [f"{'Strike':<7}{'Price':<8}{'Box':<9}{'x':<6}1h box"] + (board or ["no contracts found for these strikes"])
+        legend = "<i>⬆⬇ broken (time in box) · 🆕 new box · in0.5 = inside at · ↩ back inside · * old box</i>"
+        txt = head + "\n<pre>" + "\n".join(table) + "</pre>\n" + legend
         if len(txt) > 4000:
             txt = txt[:3990] + "…"
         try:
@@ -448,7 +436,7 @@ def run(m5_by_name, state, now, send, fetch_option, edit=None):
         except Exception as e:
             print(f"options {name} board: {e}")
         if snd:
-            sounds.append(f"🔔 <b>{name} OPTIONS · {pd.Timestamp(now):%H:%M}</b> · ATM {atm}\n\n" + "\n\n".join(snd))
+            sounds.append(f"🔔 <b>{name} OPTIONS · {pd.Timestamp(now):%H:%M}</b> · ATM {atm}\n" + "\n".join(snd))
         log.append(f"{name} ATM {atm} ({len(snd)} new)")
     print("options: " + ", ".join(log))
     if sounds:

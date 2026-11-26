@@ -47,6 +47,7 @@ jobs:
           DHAN_CLIENT_ID: ${{ secrets.DHAN_CLIENT_ID }}
           DHAN_PIN: ${{ secrets.DHAN_PIN }}
           DHAN_TOTP_SECRET: ${{ secrets.DHAN_TOTP_SECRET }}
+          ONE_INDEX: "1"          # only the index with the nearest option expiry, both bots (0 = both indexes)
           CHART_TFS: ""           # star alerts OFF (put "1h" back to turn 3-star alerts on)
           CONBOX_ALERTS: "1"      # 5m con box formed / break / same-day price overlap alerts (0 = off)
           CB_STATUS: "1"          # combined NIFTY + SENSEX con box status: new msg on change, edited every 5 min (0 = off)
@@ -54,8 +55,8 @@ jobs:
           CB_MTF_1H: "1"          # 1h MTF box line (inside / broke + time) in index + option con box (0 = off)
           TREND_ALERTS: "0"       # separate trend-change alert off (trend line stays in con box alerts)
           HLLH_ALERTS: "1"        # 5m: 3+ HL / LH in a row, one LL / HH in between allowed (0 = off)
-          OPTION_ALERTS: "1"        # options con box board ATM +-2 buy side + sound on new box / break / back inside (0 = off)
-          OPT_EOB_CONFIRM: "1"      # options EOB table, ATM +-2 buy side with CE/PE + IN ticks (0 = off)
+          OPTION_ALERTS: "1"        # options con box board ATM +-1 (3 strikes) buy side + sound on new box / break / back inside (0 = off)
+          OPT_EOB_CONFIRM: "1"      # options EOB table, ATM +-1 (3 strikes) buy side with CE/PE + IN ticks (0 = off)
           EOB_ALERTS: "1"         # 1h EOB alerts with colour: normal / dark / sweep (0 = off)
           SKIP_15M: "1"
           ALERT_2STAR: "0"        # 0 = only complete 3-star groups

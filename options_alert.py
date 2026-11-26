@@ -205,36 +205,45 @@ def _pairs(ce, pe):
     return out
 
 
-def _side_line(typ, r):
-    emo, col = EOB.COLOURS[("bear" if r["bear"] else "bull", r["hp"], r["swp"])]
-    kind = "bear" if r["bear"] else "bull"
-    return f"{typ} {emo} {col} ({kind}) · zone {r['bot']:.2f} – {r['top']:.2f}"
+def _col(r):
+    return EOB.COLOURS[("bear" if r["bear"] else "bull", r["hp"], r["swp"])]
 
 
-def _pair_text(p):
-    hh = pd.Timestamp(p["ce"]["madeEnd"], unit="ms", tz=IST).strftime("%H:%M")
-    head = f"{p['name']} {p['k']} · {hh}"
-    if p["ce"]["invalid"] or p["pe"]["invalid"]:
+def _px(v):
+    return f"{v:.2f}" if v is not None else "–"
+
+
+def _pair_rows(p):
+    """84000  CE 🔴 DARK RED · 09:35 · 255.10  /  PE 🟩 GREEN · 09:35 · 350.75   (or ❌ INVALID)"""
+    ce, pe = p["ce"], p["pe"]
+    (e1, c1), (e2, c2) = _col(ce), _col(pe)
+    k = str(p["k"])
+    pad = " " * (len(k) + 2)
+    sw = pd.Timestamp(ce["swT"], unit="ms", tz=IST).strftime("%H:%M")      # swing candle the EOB formed on
+    if ce["invalid"] or pe["invalid"]:
         why = []
         for typ in ("ce", "pe"):
             r = p[typ]
             if r["invalid"]:
                 at = pd.Timestamp(r["invAt"], unit="ms", tz=IST).strftime("%H:%M")
                 why.append(f"{typ.upper()} closed {'above' if r['bear'] else 'below'} {r['lvl']:.2f} at {at}")
-        return f"❌ <b>INVALID</b> — <s>{head} · {'UP' if p['dir'] == 1 else 'DOWN'}</s>\n" + " · ".join(why)
-    arrow = "📈 Both point UP ⬆" if p["dir"] == 1 else "📉 Both point DOWN ⬇"
-    ce, pe = p["ce"], p["pe"]
-    return "\n".join([
-        f"<b>{head}</b> · {arrow}",
-        _side_line("CE", ce),
-        _side_line("PE", pe),
-        f"Invalid if CE closes {'above' if ce['bear'] else 'below'} {ce['lvl']:.2f} "
-        f"or PE closes {'above' if pe['bear'] else 'below'} {pe['lvl']:.2f}"])
+        return f"❌ <s>{k}  CE {c1} · PE {c2} · {sw}</s>\n{pad}INVALID · " + " · ".join(why)
+    return (f"<b>{k}</b>  CE {e1} {c1} · {sw} · <b>{_px(p.get('cepx'))}</b>\n"
+            f"{pad}PE {e2} {c2} · {sw} · <b>{_px(p.get('pepx'))}</b>")
 
 
-def _eobc_message(pairs, label):
-    return "\n\n".join([f"🔱 <b>OPTIONS · EOB CONFIRMED (5m)</b> · {label}"] +
-                       [_pair_text(p) for p in pairs])
+def _eobc_message(pairs, label, now):
+    """Grouped by index + direction (index order kept); strike rows under each group."""
+    out = ["🔱 <b>OPTIONS · EOB CONFIRMED (5m)</b>"]
+    groups = {}
+    for p in pairs:
+        groups.setdefault((p["name"], p["dir"]), []).append(p)
+    for (name, d), ps in groups.items():
+        arrow = "📈 Both point UP ⬆" if d == 1 else "📉 Both point DOWN ⬇"
+        out.append(f"\n<b>{name}</b> · {arrow}")
+        out += [_pair_rows(p) for p in sorted(ps, key=lambda x: (x["ce"]["swT"], x["k"]))]
+    out.append(f"\n<i>Price = last 5m close at {pd.Timestamp(now):%H:%M} (updates every 5 min)</i>")
+    return "\n".join(out)
 
 
 def run_eob_confirm(found, state, now, send, edit, names):
@@ -255,12 +264,12 @@ def run_eob_confirm(found, state, now, send, edit, names):
                 key = f"{name}|{k}|{p['ce']['swT']}|{p['dir']}"
                 if key in sent_keys or p["ce"]["invalid"] or p["pe"]["invalid"] or p["ce"]["madeEnd"] < cutoff:
                     continue
-                p.update(name=name, k=k, key=key)
+                p.update(name=name, k=k, key=key, cepx=sides.get("CEpx"), pepx=sides.get("PEpx"))
                 new.append(p)
     n, just = 0, None
     if new:
-        label = f"{pd.Timestamp(now):%d %b %H:%M}"
-        txt = _eobc_message(new, label)
+        label = f"{pd.Timestamp(now):%H:%M}"
+        txt = _eobc_message(new, label, now)
         mid = send(txt)
         if mid:
             just = str(mid)
@@ -280,10 +289,10 @@ def run_eob_confirm(found, state, now, send, edit, names):
                      if str(p["ce"]["swT"]) == swT and str(p["dir"]) == d]
             if not match:
                 break
-            match[0].update(name=name, k=int(k), key=key)
+            match[0].update(name=name, k=int(k), key=key, cepx=sides.get("CEpx"), pepx=sides.get("PEpx"))
             pairs.append(match[0])
         else:
-            txt = _eobc_message(pairs, v["label"])
+            txt = _eobc_message(pairs, v["label"], now)
             if txt != v["text"] and edit and edit(int(mid), txt):
                 v["text"] = txt
     return n
@@ -325,6 +334,8 @@ def run(m5_by_name, state, now, send, fetch_option, edit=None):
                     if EOBC_ON and k in eob_want:
                         slot = found.setdefault(name, {}).setdefault(k, {"new": k in eob_new})
                         slot[typ] = _eobs(df, now)
+                        dc = _today_closed(df, now)
+                        slot[typ + "px"] = float(dc["Close"].iloc[-1]) if len(dc) else None
                     if k not in strikes:
                         time.sleep(0.22)
                         continue

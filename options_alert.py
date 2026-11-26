@@ -151,80 +151,42 @@ def _index_dir(m5, now):
     return side, f"Index: con box broken {word}{extra} at {bt} · spot {spot:.2f} · {xm:.2f}x"
 
 
-# ───────────────────────── con box BOARD (one edited message per index) ─────────────────────────
+# ───────────────────────── con box BOARD (one edited message) + alerts on NEW box / U / D ─────────────────────────
 def _hm2(ms, now):
     x = pd.Timestamp(ms, unit="ms", tz=IST)
     return x.strftime("%H:%M") if x.date() == pd.Timestamp(now).date() else x.strftime("%d %b %H:%M")
 
 
-def _fibs(lo, hi, side, after):
-    rg = hi - lo
-    out = []
-    for m in (1.5, 2.0, 2.5):
-        lv = lo + m * rg if side == 1 else hi - m * rg
-        hit = any(v >= lv for v in after) if side == 1 else any(v <= lv for v in after)
-        out.append((m, lv, hit))
-    return out
-
-
-def _board_strike(k, typ, df, now, both=False):
-    """(table row, short 1h text) for one option: latest box today, else the last old box (marked *)."""
-    tag = f"{k}{typ[0]}" if both else str(k)
+def strike_state(df, now):
+    """Latest 5m con box of one option (today, else the last old box):
+    dict(tag '5m' / '5m+1h', dur, st 'In' / 'U' / 'D', firstT, today) or None if no box."""
     dfc = df[[(x + pd.Timedelta(minutes=5)) <= now for x in df.index]]
     if len(dfc) < 3:
-        return f"{tag:<7}no data", "—"
+        return None
     CB.replay(dfc, 0.05)
-    recs, C, t = CB.LAST["recs"], CB.LAST["C"], CB.LAST["t"]
-    price = C[-1]
-    m1 = "—"
-    try:
-        m1 = CB.mtf_short(CB.mtf_status(dfc, now, 0.05))
-    except Exception as e:
-        print(f"options {k}{typ} 1h box: {e}")
+    recs, C = CB.LAST["recs"], CB.LAST["C"]
     live = [r for r in recs if not r["dead"]]
     if not live:
-        return f"{tag:<7}{price:<8.1f}{'none':<9}{'—':<6}{m1}", m1
+        return None
     today = pd.Timestamp(now).date()
     tb = [r for r in live if pd.Timestamp(r["firstT"], unit="ms", tz=IST).date() == today]
     r = max(tb, key=lambda x: x["firstT"]) if tb else max(live, key=lambda x: (x["rightT"], x["firstT"]))
-    hi, lo = r["hi"], r["lo"]
-    rg = (hi - lo) or 1e-9
-    star = "" if tb else "*"
-    xs = "—"
-    if r["live"]:
-        x = (price - lo) / rg
-        lvl = 1.0 if x >= 1 else 0.75 if x >= 0.75 else 0.5 if x >= 0.5 else 0.25 if x >= 0.25 else 0.0
-        box = f"{'🆕' if tb else ''}in{lvl:g}{star}"
-    else:
-        bi = r.get("brkIdx", -1)
-        bi = bi if 0 <= bi < len(C) else len(C) - 1
-        sd_now = 0
-        for j in range(bi, len(C)):
-            sd_now = 1 if C[j] > hi else -1 if C[j] < lo else 0
-        if sd_now == 0:
-            box = f"↩in{star}"
-        else:
-            box = f"{'⬆' if sd_now == 1 else '⬇'}{CB._dur(r)}{star}"
-            xs = f"{((price - lo) / rg if sd_now == 1 else (hi - price) / rg):.1f}x"
-    return f"{tag:<7}{price:<8.1f}{box:<9}{xs:<6}{m1}", m1
+    box = dict(firstT=r["firstT"], hi=r["hi"], lo=r["lo"])
+    try:
+        tag = CB.box_tag(box, CB.mtf_boxes(dfc, now, 0.05))
+    except Exception as e:
+        print(f"options 1h box: {e}")
+        tag = "5m"
+    c = C[-1]
+    st = "In" if r["live"] or r["lo"] <= c <= r["hi"] else ("U" if c > r["hi"] else "D")
+    return dict(tag=tag, dur=CB._dur(r), st=st, firstT=r["firstT"], today=bool(tb))
 
 
-def _f(v):
-    return f"{v:.0f}" if abs(v) >= 1000 else f"{v:.1f}"
-
-
-def _sound_text(k, typ, ev, price, m1, now):
-    """Compact alert (new message, with sound) for NEW box / BRK / IN."""
-    hh = _hm2(ev["end"], now)
-    box = f"{_f(ev['lo'])}–{_f(ev['hi'])}"
-    if ev["kind"] == "NEW":
-        return f"🆕 <b>{k} {typ} · NEW BOX {hh}</b> · {price:.2f} · {box}"
-    if ev["kind"] == "IN":
-        return f"↩ <b>{k} {typ} · BACK INSIDE {hh}</b> · {price:.2f}"
-    sd = ev["side"]
-    tg = " / ".join(_f(lv) + (" ✓" if h else "") for _, lv, h in _fibs(ev["lo"], ev["hi"], sd, ev["after"]))
-    return (f"{'⬆' if sd == 1 else '⬇'} <b>{k} {typ} · BROKE {'UP' if sd == 1 else 'DOWN'} {hh}</b> · {price:.2f}\n"
-            f"Box {box} · T {tg} · 1h: {m1}")
+def _brow(label, s):
+    """Strike  Box     Time  Status"""
+    if not s:
+        return f"{label:<9}—"
+    return f"{label:<9}{s['tag']:<8}{s['dur']:<6}{s['st']}"
 
 
 def _post_board(state, name, txt, now, send, edit):
@@ -281,32 +243,33 @@ def _row(row, sides, idx_eobs):
     return dict(r=r, px=sides.get(buy + "px"), opp=t_opp, idx=t_idx)
 
 
+def _eob_rows(rs):
+    """aligned rows: Strike  PE         Time   CE  IN"""
+    out = []
+    for row in sorted(rs, key=lambda x: (x["swT"], x["k"])):
+        v = row["v"]
+        k = f"{row['k']:<8}"
+        if v["r"]["invalid"]:
+            out.append(f"{k}❌ INVALID {_hh(v['r']['invAt'])}")
+            continue
+        emo = _col(v["r"])[0]
+        px = f"{v['px']:.2f}" if v["px"] is not None else "–"
+        out.append(f"{k}{emo} {px:<8} {_hh(row['swT']):<7}{'✅' if v['opp'] else '❌'}  {'✅' if v['idx'] else '❌'}")
+    return out
+
+
 def _eobc_message(rows, now):
-    """Table per index + direction:  Strike  PE  Time  CE  IN"""
-    out = ["🔱 <b>OPTIONS · EOB</b>"]
+    """🔱 SENSEX · EOB · ⬇ PE  +  table"""
+    out = []
     groups = {}
     for row in rows:
         groups.setdefault((row["name"], row["dir"]), []).append(row)
     for (name, d), rs in groups.items():
         buy, opp = ("PE", "CE") if d == -1 else ("CE", "PE")
-        head = f"📉 Index DOWN ⬇ → buy PE" if d == -1 else f"📈 Index UP ⬆ → buy CE"
-        lines = [f"{'Strike':<8} {buy:<11} {'Time':<7} {opp:<4} IN"]
-        for row in sorted(rs, key=lambda x: (x["swT"], x["k"])):
-            v = row["v"]
-            k = f"{row['k']:<8}"
-            if v["r"]["invalid"]:
-                lines.append(f"{k} ❌ INVALID · closed below {v['r']['lvl']:.2f} at {_hh(v['r']['invAt'])}")
-                continue
-            emo = _col(v["r"])[0]
-            px = f"{v['px']:.2f}" if v["px"] is not None else "–"
-            lines.append(f"{k} {emo} {px:<8} {_hh(row['swT']):<7} {'✅' if v['opp'] else '❌'}   "
-                         f"{'✅' if v['idx'] else '❌'}")
-        out.append(f"\n<b>{name}</b> · {head}\n<pre>" + "\n".join(lines) + "</pre>")
-    out.append(f"<i>Price = last 5m close at {pd.Timestamp(now):%H:%M} (updates every 5 min)\n"
-               f"Time = swing candle · CE/PE = other option made the opposite EOB at the same time · "
-               f"IN = index made the same-direction EOB at the same time\n"
-               f"🟩 green 🟢 dark green · 🟦 blue 🔵 dark blue</i>")
-    return "\n".join(out)
+        head = f"🔱 <b>{name} · EOB · {'⬇ PE' if d == -1 else '⬆ CE'}</b>"
+        lines = [f"{'Strike':<8}{buy:<12}{'Time':<7}{opp:<4}IN"] + _eob_rows(rs)
+        out.append(head + "\n<pre>" + "\n".join(lines) + "</pre>")
+    return "\n\n".join(out)
 
 
 def run_eob_confirm(found, idxinfo, state, now, send, edit, names):
@@ -363,22 +326,51 @@ def run_eob_confirm(found, idxinfo, state, now, send, edit, names):
     return n
 
 
-def run(m5_by_name, state, now, send, fetch_option, edit=None):
-    """Called once per check after the index loop. fetch_option(seg, security_id, now) -> 5m DataFrame (few days)."""
+def _ask_reply(name, k, types, contracts, fetch_option, now, cache):
+    """Reply to a typed strike: con box + EOB for CE and / or PE of that strike."""
+    rows, erows = [], []
+    for typ in types:
+        sid = contracts[name]["map"].get(f"{k}{typ}")
+        if not sid:
+            rows.append(f"{typ:<9}no contract")
+            continue
+        df = cache.get((k, typ))
+        if df is None:
+            df = fetch_option(CFG[name]["seg"], sid, now)
+            time.sleep(0.22)
+        rows.append(_brow(typ, strike_state(df, now)))
+        eobs = [e for e in _eobs(df, now)]
+        dc = _today_closed(df, now)
+        px = f"{float(dc['Close'].iloc[-1]):.2f}" if len(dc) else "–"
+        if eobs:
+            e = max(eobs, key=lambda x: x["swT"])
+            emo = _col(e)[0]
+            cell = "❌ invalid" if e["invalid"] else f"{emo} {'bear' if e['bear'] else 'bull'}"
+            erows.append(f"{typ:<6}{cell:<11}{_hh(e['swT']):<7}{px}")      # emoji = 2 cells
+        else:
+            erows.append(f"{typ:<6}{'—':<12}{'':<7}{px}")
+    head = f"🔎 <b>{name} {k} · {pd.Timestamp(now):%H:%M}</b>"
+    body = [f"{'Type':<9}{'Box':<8}{'Time':<6}Status"] + rows + ["", f"{'EOB':<6}{'Colour':<12}{'Time':<7}Price"] + erows
+    return head + "\n<pre>" + "\n".join(body) + "</pre>"
+
+
+def run(m5_by_name, state, now, send, fetch_option, edit=None, asks=None):
+    """Called once per check after the index loop. fetch_option(seg, security_id, now) -> 5m DataFrame (few days).
+    asks: texts typed to the options bot since the last run ('eob', '84000', '84000PE')."""
     if not OPT_ON:
         return 0
     contracts = load_contracts(now)
-    cutoff = CB._ms(now) - WINDOW_MIN * 60000
     found = {}                                             # option EOB table: {name: {strike: {"CE": [...], ...}}}
     want = {}                                              # strikes of today's sent EOB rows (kept updated)
     for v in state.get("_eobc", {}).values():
         for r in v.get("rows", []):
             want.setdefault(r["name"], set()).add(int(r["k"]))
-    idxinfo, log, sounds, keys, sent = {}, [], [], [], 0
-    names = order_names(now)
+    idxinfo, log, alerts, sent = {}, [], [], 0
+    last_st = state.setdefault("_optst", {})
+    today = pd.Timestamp(now).strftime("%Y-%m-%d")
+    names = [n for n in order_names(now) if n in contracts and n in m5_by_name]
+    cache = {}
     for name in names:
-        if name not in contracts or name not in m5_by_name:
-            continue
         step = CFG[name]["step"]
         m5 = m5_by_name[name]
         closed = m5[[(x + pd.Timedelta(minutes=5)) <= now for x in m5.index]]
@@ -386,7 +378,7 @@ def run(m5_by_name, state, now, send, fetch_option, edit=None):
             continue
         spot = float(closed["Close"].iloc[-1])
         atm = int(round(spot / step)) * step                 # recalculated every check
-        idx_dir, idx_line = _index_dir(m5, now)
+        idx_dir, _ = _index_dir(m5, now)
         if EOBC_ON:
             try:
                 idxinfo[name] = (idx_dir, _idx_eobs(m5, now))
@@ -395,7 +387,7 @@ def run(m5_by_name, state, now, send, fetch_option, edit=None):
         strikes = [atm + j * step for j in range(-SIDE_N, SIDE_N + 1)]
         eob_new = {atm + j * step for j in range(-EOBC_SIDE, EOBC_SIDE + 1)}
         buy = ("PE",) if idx_dir == -1 else ("CE",) if idx_dir == 1 else ("CE", "PE")
-        board, snd = [], []
+        board, al = [], []
         for k in sorted(set(strikes) | eob_new | want.get(name, set())):
             for typ in ("CE", "PE"):
                 sid = contracts[name]["map"].get(f"{k}{typ}")
@@ -403,6 +395,7 @@ def run(m5_by_name, state, now, send, fetch_option, edit=None):
                     continue
                 try:
                     df = fetch_option(CFG[name]["seg"], sid, now)
+                    cache[(k, typ)] = df
                     time.sleep(0.22)                       # stay under Dhan's data rate limit
                     if EOBC_ON:
                         slot = found.setdefault(name, {}).setdefault(k, {"new": k in eob_new})
@@ -411,49 +404,66 @@ def run(m5_by_name, state, now, send, fetch_option, edit=None):
                         slot[typ + "px"] = float(dc["Close"].iloc[-1]) if len(dc) else None
                     if k not in strikes or typ not in buy:
                         continue
-                    btxt, mtf = _board_strike(k, typ, df, now, both=len(buy) == 2)
-                    board.append(btxt)
-                    price, evs = _track(df, now)
+                    st = strike_state(df, now)
                 except Exception as e:
                     print(f"options {name} {k}{typ}: {e}")
                     continue
-                for ev in evs:
-                    skey = f"{name}|optcb|{k}{typ}|{ev['firstT']}|{ev['kind']}{ev['side']}|{ev['end']}"
-                    if skey in state or ev["end"] < cutoff:
-                        continue
-                    snd.append(_sound_text(k, typ, ev, price, mtf, now))
-                    keys.append(skey)
-        exp = pd.Timestamp(contracts[name]["expiry"]).strftime("%d %b")
-        side_txt = "Index DOWN ⬇ → PE" if idx_dir == -1 else "Index UP ⬆ → CE" if idx_dir == 1 else "Index inside box → CE + PE"
-        head = f"📊 <b>{name} OPTIONS</b> · {pd.Timestamp(now):%H:%M} · exp {exp}\nATM {atm} · {side_txt}"
-        table = [f"{'Strike':<7}{'Price':<8}{'Box':<9}{'x':<6}1h box"] + (board or ["no contracts found for these strikes"])
-        legend = "<i>⬆⬇ broken (time in box) · 🆕 new box · in0.5 = inside at · ↩ back inside · * old box</i>"
-        txt = head + "\n<pre>" + "\n".join(table) + "</pre>\n" + legend
-        if len(txt) > 4000:
-            txt = txt[:3990] + "…"
+                label = f"{k}{typ[0]}" if len(buy) == 2 else str(k)
+                board.append(_brow(label, st))
+                # alert: a NEW box today, or the status changed to U / D (silent while inside)
+                key = f"{name}|{k}{typ}"
+                prev = last_st.get(key)
+                if st and prev and prev.get("day") == today:
+                    if st["today"] and st["firstT"] != prev.get("firstT"):
+                        al.append(_brow(f"{k}{typ}", dict(st, st="NEW")))
+                    elif st["firstT"] == prev.get("firstT") and st["st"] in ("U", "D") and st["st"] != prev.get("st"):
+                        al.append(_brow(f"{k}{typ}", st))
+                if st:
+                    last_st[key] = dict(day=today, firstT=st["firstT"], st=st["st"])
+        arrow = "⬇ PE" if idx_dir == -1 else "⬆ CE" if idx_dir == 1 else "CE + PE"
+        hdr = f"{'Strike':<9}{'Box':<8}{'Time':<6}Status"
+        txt = f"📊 <b>{name} OPTIONS · {pd.Timestamp(now):%H:%M} · {arrow}</b>\n<pre>" + \
+              "\n".join([hdr] + (board or ["—"])) + "</pre>"
         try:
             sent += _post_board(state, name, txt, now, send, edit)
         except Exception as e:
             print(f"options {name} board: {e}")
-        if snd:
-            sounds.append(f"🔔 <b>{name} OPTIONS · {pd.Timestamp(now):%H:%M}</b> · ATM {atm}\n" + "\n".join(snd))
-        log.append(f"{name} ATM {atm} ({len(snd)} new)")
+        if al:
+            alerts.append(f"🔔 <b>{name} OPTIONS · {pd.Timestamp(now):%H:%M}</b>\n<pre>" + "\n".join([hdr] + al) + "</pre>")
+        log.append(f"{name} ATM {atm} ({len(al)} alerts)")
     print("options: " + ", ".join(log))
-    if sounds:
-        msgs, cur = [], ""
-        for blk in sounds:
-            if cur and len(cur) + len(blk) > 3800:
-                msgs.append(cur)
-                cur = ""
-            cur = (cur + "\n\n" + blk) if cur else blk
-        msgs.append(cur)
-        if all(send(m[:4090]) for m in msgs):
-            for k in keys:
-                state[k] = pd.Timestamp(now).isoformat()
-            sent += len(msgs)
+    for m in alerts:
+        if send(m[:4090]):
+            sent += 1
     if EOBC_ON:
         try:
             sent += run_eob_confirm(found, idxinfo, state, now, send, edit, names)
         except Exception as e:
             print("options EOB confirm error:", e)
+    # replies to typed requests
+    import re
+    for q in asks or []:
+        q = q.strip().upper().replace(" ", "")
+        if not names:
+            break
+        name = names[0]
+        try:
+            if q in ("EOB", "/EOB"):
+                rows = []
+                for v in state.get("_eobc", {}).values():
+                    if v.get("day") != today:
+                        continue
+                    for r in v["rows"]:
+                        sides = found.get(r["name"], {}).get(int(r["k"]))
+                        vv = _row(r, sides, idxinfo.get(r["name"], (0, []))[1]) if sides else None
+                        if vv:
+                            rows.append(dict(r, v=vv))
+                send(_eobc_message(rows, now) if rows else f"🔱 <b>{name} · EOB</b>\nnone today")
+                continue
+            m = re.fullmatch(r"/?(\d{4,6})(CE|PE)?", q)
+            if m and name in contracts:
+                types = (m.group(2),) if m.group(2) else ("CE", "PE")
+                send(_ask_reply(name, int(m.group(1)), types, contracts, fetch_option, now, cache))
+        except Exception as e:
+            print(f"options reply '{q}': {e}")
     return sent

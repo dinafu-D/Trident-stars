@@ -128,17 +128,14 @@ def _fmt(ms):
 
 
 def message(name, r):
-    """🟪 NIFTY 1h · EOB PURPLE / Bearish · sweep / Zone / Swing high / Invalid if ..."""
+    """🟥 SENSEX 1h · EOB · 11:15  +  table: Colour / Time / Zone"""
     emo, col = COLOURS[("bear" if r["bear"] else "bull", r["hp"], r["swp"])]
-    kind = ("Bearish (sell zone)" if r["bear"] else "Bullish (buy zone)") + \
-           (" · swept liquidity" if r["swp"] else "") + (" · FVG followed" if r["hp"] else "")
-    side = "high" if r["bear"] else "low"
-    return "\n".join([
-        f"{emo} <b>{name} {TF} · EOB {col}</b>",
-        kind,
-        f"Zone: {r['bot']:.2f} – {r['top']:.2f}",
-        f"Swing {side}: {r['lvl']:.2f} · {_fmt(r['swT'])}",
-        f"Invalid if a {TF} candle closes {'above' if r['bear'] else 'below'} {r['lvl']:.2f}"])
+    made = pd.Timestamp(r["madeEnd"], unit="ms", tz=IST).strftime("%H:%M")
+    sw = pd.Timestamp(r["swT"], unit="ms", tz=IST).strftime("%H:%M")
+    cell = f"{emo} {col}"
+    return "\n".join([f"{emo} <b>{name} {TF} · EOB · {made}</b>", "<pre>" +
+                      f"{'Colour':<14}{'Time':<7}Zone\n" +
+                      f"{cell:<14}{sw:<7}{r['bot']:,.2f}–{r['top']:,.2f}" + "</pre>"])
 
 
 def run(name, h1, state, now, send, edit, remember, delete_taken):
@@ -175,7 +172,9 @@ def run(name, h1, state, now, send, edit, remember, delete_taken):
                 edit(mid, txt)
                 msgs[skey][2] = txt.split("\n")[0]
             emo, col = COLOURS[("bear" if r["bear"] else "bull", True, r["swp"])]
-            rtxt = f"{emo} <b>{name} {TF} · EOB {_fmt(r['swT'])} is now {col}</b> (FVG followed)"
+            _, old = COLOURS[("bear" if r["bear"] else "bull", False, r["swp"])]
+            sw = pd.Timestamp(r["swT"], unit="ms", tz=IST).strftime("%H:%M")
+            rtxt = f"↪ <b>{name} {TF} EOB {sw} · {old} → {emo} {col}</b>"
             rid = send(rtxt, reply_to=mid)
             if rid:
                 remember(state, skey + "|re", rid, rtxt)          # deleted together with the alert later

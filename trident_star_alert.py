@@ -279,14 +279,10 @@ def load_state():
 def save_state(state):
     cutoff = (now_ist() - pd.Timedelta(days=10)).isoformat()
     msgs = {k: v for k, v in state.get("_msgs", {}).items() if v[1] >= cutoff}
-    warn = state.get("_dhan_warn")
-    cbstat = state.get("_cbstat")
+    keep = {k: v for k, v in state.items() if k.startswith("_")}      # boards, EOB tables, option status, offsets
     state = {k: v for k, v in state.items() if not k.startswith("_") and v >= cutoff}
+    state.update(keep)
     state["_msgs"] = msgs
-    if warn:
-        state["_dhan_warn"] = warn
-    if cbstat:
-        state["_cbstat"] = cbstat
     state["_last_run"] = now_ist().isoformat()
     os.makedirs(os.path.dirname(STATE_FILE) or ".", exist_ok=True)
     with open(STATE_FILE, "w") as f:
@@ -319,6 +315,28 @@ def _tg_send(token, chat, text, reply_to=None):
 def send(text, reply_to=None):
     """Send on the main bot. Returns message id (truthy) or None if it failed."""
     return _tg_send(TG_TOKEN, TG_CHAT, text, reply_to)
+
+
+def opt_asks(state):
+    """Texts typed to the OPTIONS bot (your chat only) since the last run: 'eob', '84000', '84000PE'."""
+    if not OPT_TG_TOKEN:
+        return []
+    try:
+        r = requests.get(f"https://api.telegram.org/bot{OPT_TG_TOKEN}/getUpdates", timeout=20,
+                         params={"offset": int(state.get("_optupd", 0)) + 1, "timeout": 0})
+        res = r.json().get("result", []) if r.ok else []
+    except Exception as e:
+        print("Telegram getUpdates error:", str(e).replace(OPT_TG_TOKEN, "***"))
+        return []
+    out = []
+    for u in res:
+        state["_optupd"] = max(int(state.get("_optupd", 0)), int(u["update_id"]))
+        m = u.get("message") or {}
+        if str(m.get("chat", {}).get("id")) == str(OPT_TG_CHAT) and m.get("text"):
+            out.append(m["text"])
+    if out:
+        print(f"options bot requests: {out}")
+    return out
 
 
 def send_opt(text, reply_to=None):
@@ -524,7 +542,7 @@ def main():
             print(f"{name} {tf}: {len(chart)} candles, {sum(len(g) == 3 for _, _, g in groups)} 3-star, {sum(len(g) == 2 for _, _, g in groups)} 2-star live")
     if options_alert and dhan_m5 and dhan_data and dhan_data.enabled():
         try:
-            sent_any += options_alert.run(dhan_m5, state, now, send_opt, dhan_data.fetch_option, edit_opt)
+            sent_any += options_alert.run(dhan_m5, state, now, send_opt, dhan_data.fetch_option, edit_opt, opt_asks(state))
         except Exception as e:
             print(f"options error {e}")
     if conbox_alert:

@@ -30,7 +30,9 @@ ATR_LEN, ATR_MULT = 5, 2.5
 EMA_LEN = int(os.getenv("EMA_LEN", "6"))
 WINDOW_MIN = int(os.getenv("CB_WINDOW_MIN", "20"))      # only send events from the last N minutes (no old flood)
 CB_ON = os.getenv("CONBOX_ALERTS", "1") == "1"
-TREND_ON = os.getenv("TREND_ALERTS", "0") == "1"       # separate trend-change alert (off; trend line stays in con box alerts)
+TREND_ON = os.getenv("TREND_ALERTS", "0") == "1"       # old EMA trend alert (off)
+TCHG_ON = os.getenv("TREND_CHANGE_ALERTS", "1") == "1"  # trend change: HH+HL = UP, LL+LH = DOWN (one opposite swing allowed)
+OVL_ON = os.getenv("CB_OVERLAP", "0") == "1"            # same-day con box overlap alert (off)
 CHAIN_ON = os.getenv("HLLH_ALERTS", "1") == "1"         # 3+ HL / LH in a row (one LL / HH in between allowed)
 CHAIN_MIN = 3
 TICK = {"NIFTY": 0.05, "SENSEX": 0.01}
@@ -38,7 +40,8 @@ TICK = {"NIFTY": 0.05, "SENSEX": 0.01}
 
 LAST = {}          # last replay: boxes + closes (for the status message)
 STATUS = {}        # per index: (signature, text) for the combined status message
-MTF = {}           # per index: current 1h MTF box line
+MTF = {}           # per index: current 1h MTF box line (short)
+HBOX = {}          # per index: 1h MTF boxes (firstT, hi, lo) for the 5m+1h tag
 STATUS_ON = os.getenv("CB_STATUS", "1") == "1"
 
 
@@ -119,6 +122,8 @@ def replay(m5, tick, tf_min=TF_MIN):
     hT = lT = 0
     pivH = pivL = None
     trLastAl = 0
+    trState, lastHt, lastLt = 0, None, None          # trend state (HH+HL = UP, LL+LH = DOWN) for change alerts
+    allsw = []                                      # every swing: (time, price, tag HH/LH/HL/LL)
     events = []
     # HL / LH chains: list of (price, time, tag) incl. the starting swing; one opposite swing allowed (not back to back)
     loPrev = hiPrev = None
@@ -265,11 +270,13 @@ def replay(m5, tick, tf_min=TF_MIN):
             if isH:
                 if lastH is not None and sv != lastH:
                     hT = 1 if sv > lastH else -1
-                lastH, pivH = sv, sv
+                    allsw.append((t[p], sv, "HH" if hT == 1 else "LH"))
+                lastH, pivH, lastHt = sv, sv, t[p]
             else:
                 if lastL is not None and sv != lastL:
                     lT = 1 if sv > lastL else -1
-                lastL, pivL = sv, sv
+                    allsw.append((t[p], sv, "HL" if lT == 1 else "LL"))
+                lastL, pivL, lastLt = sv, sv, t[p]
         # HL / LH chain (same swings and labels as TRIDENT: compared with the previous swing low / high)
         for isH, sv in sw:
             if not isH:
@@ -282,7 +289,8 @@ def replay(m5, tick, tf_min=TF_MIN):
                         loBad = False
                         if loCnt >= CHAIN_MIN:
                             events.append(dict(kind="HL", end=end[i], key=f"HL|{t[p]}", n=loCnt,
-                                               chain=list(loChain), trend=None, close=close))
+                                               chain=list(loChain), trend=None, close=close, st=trState,
+                                               sw=[x for x in allsw if x[0] >= loChain[0][1]]))
                     elif loChain:                           # LL inside a chain
                         if loBad:                           # 2nd LL back to back -> chain broken
                             loChain, loCnt, loBad = [], 0, False
@@ -300,7 +308,8 @@ def replay(m5, tick, tf_min=TF_MIN):
                         hiBad = False
                         if hiCnt >= CHAIN_MIN:
                             events.append(dict(kind="LH", end=end[i], key=f"LH|{t[p]}", n=hiCnt,
-                                               chain=list(hiChain), trend=None, close=close))
+                                               chain=list(hiChain), trend=None, close=close, st=trState,
+                                               sw=[x for x in allsw if x[0] >= hiChain[0][1]]))
                     elif hiChain:                           # HH inside a chain
                         if hiBad:                           # 2nd HH back to back -> chain broken
                             hiChain, hiCnt, hiBad = [], 0, False
@@ -312,6 +321,13 @@ def replay(m5, tick, tf_min=TF_MIN):
         eSide = 0 if ema[i] is None else (1 if close > ema[i] else -1 if close < ema[i] else 0)
         trConf = trDir if (trDir != 0 and eSide == trDir) else 0
         trend = dict(dir=trDir, hT=hT, lT=lT, eSide=eSide, ema=ema[i], conf=trConf, lastH=lastH, lastL=lastL)
+        if trDir != 0 and trDir != trState:            # trend change: both last high and low flipped
+            if trState != 0:
+                last2 = sorted([(lastHt, lastH, "HH" if hT == 1 else "LH"), (lastLt, lastL, "HL" if lT == 1 else "LL")])
+                events.append(dict(kind="TC", end=end[i], key=f"TC|{t[i]}", frm=trState, to=trDir,
+                                   sw=last2, trend=dict(dir=trDir), close=close))
+            trState = trDir
+        trend["st"] = trState
         if trConf != 0 and trConf != trLastAl:
             events.append(dict(kind="T", end=end[i], key=f"T|{t[i]}", trend=trend, close=close))
             trLastAl = trConf
@@ -410,6 +426,47 @@ def mtf_status(m5, now, tick):
                 dur=_dur(r, 60), brk_t=brk_t, close=c)
 
 
+def mtf_boxes(m5, now, tick):
+    """All 1h MTF boxes (not merged away): list of (firstT, hi, lo)."""
+    h = hourly(m5, now)
+    if h is None or len(h) < 4:
+        return []
+    saved = dict(LAST)
+    try:
+        replay(h, tick, tf_min=60)
+        return [(r["firstT"], r["hi"], r["lo"]) for r in LAST["recs"] if not r["dead"]]
+    finally:
+        LAST.clear()
+        LAST.update(saved)
+
+
+def box_tag(b, hboxes):
+    """'5m+1h' when the 5m box lies inside a 1h box that started before it, else '5m'."""
+    for ft, hi, lo in hboxes:
+        if ft <= b["firstT"] and lo <= b["lo"] and b["hi"] <= hi:
+            return "5m+1h"
+    return "5m"
+
+
+def _p(v):
+    """84,120 for big numbers, 371.20 for option premiums"""
+    return f"{v:,.0f}" if abs(v) >= 10000 else f"{v:,.2f}"
+
+
+def mtf_short(st):
+    """3h · in 0.5  |  3h U 1.30x  |  — (no 1h box)"""
+    if not st:
+        return "—"
+    if st["live"]:
+        x = st["x"]
+        lvl = 1.0 if x >= 1 else 0.75 if x >= 0.75 else 0.5 if x >= 0.5 else 0.25 if x >= 0.25 else 0.0
+        if st["lo"] <= st["close"] <= st["hi"]:
+            return f"{st['dur']} · in {lvl:g}"
+        return f"{st['dur']} · 5m {'above' if st['close'] > st['hi'] else 'below'}"
+    lab = "U" if st["brk"] == 1 else "D" if st["brk"] == -1 else "B"
+    return f"{st['dur']} {lab} {st['x']:.1f}x"
+
+
 def mtf_line(st, now):
     """📦 1h box 24500.00–24620.00 · 3h · inside at 0.5   |   📦 1h box ... · 3h U 1.30x · broke 11:15"""
     if not st:
@@ -445,58 +502,62 @@ def _trend_line(tr):
     return f"Trend: {d} ({s}) · {e} EMA{EMA_LEN}{ok}"
 
 
+def _tr_word(d):
+    return "UP" if d == 1 else "DOWN" if d == -1 else "SIDE"
+
+
 def _chain_message(name, ev):
-    """🟢 NIFTY 5m · 3 HIGHER LOWS (HL) in a row / Lows: a → b → c → d / Times: ... / note"""
+    """📈 SENSEX 5m · UP · HL ×4 · 11:10  +  table of every swing in the chain"""
     up = ev["kind"] == "HL"
-    pts = ev["chain"][-8:]                                  # last 8 swings (long chains are shortened)
-    more = len(ev["chain"]) > len(pts)
-    opp = "LL" if up else "HH"
-    n_opp = sum(1 for _, _, tag in ev["chain"] if tag == opp)
-    head = (f"🟢 <b>{name} 5m · {ev['n']} HIGHER LOWS (HL)" if up else f"🔴 <b>{name} 5m · {ev['n']} LOWER HIGHS (LH)") + \
-           (" in a row</b>" if not n_opp else f"</b> ({n_opp} {opp} in between)")
-    last_day = pd.Timestamp(pts[-1][1], unit="ms", tz=IST).date()
+    tr = ev.get("st", 0)
+    rows = ev.get("sw") or [(x, v, tag or ("L" if up else "H")) for v, x, tag in ev["chain"]]
+    rows = rows[-16:]
+    when = pd.Timestamp(ev["end"] - TF_MIN * 60000, unit="ms", tz=IST).strftime("%H:%M")
+    head = f"{'📈' if up else '📉'} <b>{name} 5m · {_tr_word(tr)} · {'HL' if up else 'LH'} ×{ev['n']} · {when}</b>"
+    last_day = pd.Timestamp(rows[-1][0], unit="ms", tz=IST).date()
 
     def tm(ms):
         x = pd.Timestamp(ms, unit="ms", tz=IST)
-        return x.strftime("%H:%M") if x.date() == last_day else x.strftime("%d %b %H:%M")
-    prices = " → ".join(f"{v:.2f}" + (f" ({tag})" if tag == opp else "") for v, _, tag in pts)
-    times = " · ".join(tm(x) for _, x, _ in pts)
-    return "\n".join([head,
-                      ("Lows: " if up else "Highs: ") + ("… → " if more else "") + prices,
-                      "Times: " + ("… · " if more else "") + times,
-                      "Buyers stepping in higher — watch for upside" if up else
-                      "Sellers pushing lower — watch for downside"])
+        return x.strftime("%H:%M") if x.date() == last_day else x.strftime("%d%b %H:%M")
+    body = [f"{'Swing':<7}{'Time':<12}Price"] + [f"{tag:<7}{tm(x):<12}{_p(v)}" for x, v, tag in rows]
+    return head + "\n<pre>" + "\n".join(body) + "</pre>"
 
 
-def message(name, ev):
-    """Index 5m alerts; con box alerts carry the 1h MTF box line."""
+def _tc_message(name, ev):
+    """🔄 SENSEX 5m · TREND CHANGE · 11:30 / DOWN → UP / last high + low"""
+    when = pd.Timestamp(ev["end"] - TF_MIN * 60000, unit="ms", tz=IST).strftime("%H:%M")
+    body = [f"{'Swing':<7}{'Time':<7}Price"] + \
+           [f"{tag:<7}{pd.Timestamp(x, unit='ms', tz=IST):%H:%M}  {_p(v)}" for x, v, tag in ev["sw"]]
+    return (f"🔄 <b>{name} 5m · TREND CHANGE · {when}</b>\n{_tr_word(ev['frm'])} → {_tr_word(ev['to'])}\n<pre>"
+            + "\n".join(body) + "</pre>")
+
+
+def _targets(lo, hi, side):
+    rg = hi - lo
+    return [(m, lo + m * rg if side == 1 else hi - m * rg) for m in (1.5, 2.0, 2.5)]
+
+
+def message(name, ev, tag="5m"):
+    """Index 5m alerts (aligned tables)."""
     if ev["kind"] in ("HL", "LH"):
         return _chain_message(name, ev)
+    if ev["kind"] == "TC":
+        return _tc_message(name, ev)
     if ev["kind"] == "O":
         return _overlap_message(name, ev)
     tr = ev["trend"]
-    when = _fmt_t(ev["end"] - TF_MIN * 60000)
+    when = pd.Timestamp(ev["end"] - TF_MIN * 60000, unit="ms", tz=IST).strftime("%H:%M")
     if ev["kind"] == "T":
         up = tr["conf"] == 1
-        return "\n".join([
-            f"{'🟢' if up else '🔴'} <b>{name} 5m · TREND {'UP ▲' if up else 'DOWN ▼'}</b>",
-            (f"Higher High {tr['lastH']:.2f} · Higher Low {tr['lastL']:.2f}" if up else
-             f"Lower High {tr['lastH']:.2f} · Lower Low {tr['lastL']:.2f}"),
-            f"Price {ev['close']:.2f} {'above' if up else 'below'} EMA{EMA_LEN} {tr['ema']:.2f} ✓",
-            f"Time: {when}"])
+        return f"{'📈' if up else '📉'} <b>{name} 5m · TREND {'UP' if up else 'DOWN'} · {when}</b>"
     b = ev["box"]
-    pct = (b["hi"] - b["lo"]) / b["lo"] * 100 if b["lo"] else 0
-    box = f"Box: {b['lo']:.2f} – {b['hi']:.2f} ({pct:.2f}%)"
-    if ev["kind"] == "F":
-        lines = [f"⬜ <b>{name} 5m · CON BOX FORMED</b>", box,
-                 f"Started {_fmt_t(b['firstT'])} · running {b['dur']}"]
-    else:
-        head = {"U": f"🟢 <b>{name} 5m · CON BOX BROKEN UP ⬆</b>",
-                "D": f"🔴 <b>{name} 5m · CON BOX BROKEN DOWN ⬇</b>",
-                "B": f"🟣 <b>{name} 5m · CON BOX BROKEN BOTH SIDES</b>"}[ev["kind"]]
-        lines = [head, f"{box} · lasted {b['dur']}", f"Closed at {ev['close']:.2f} · {when}"]
-    extra = [MTF[name]] if (MTF_ON and MTF.get(name)) else []
-    return "\n".join(lines + extra + [_trend_line(tr)])
+    st = {"F": "NEW", "U": "U", "D": "D", "B": "B"}[ev["kind"]]
+    head = f"🔔 <b>{name} 5m · {'NEW BOX' if ev['kind'] == 'F' else 'BREAK'} · {when}</b>"
+    rows = [f"{'Box':<8}{'Time':<6}{'Status':<8}Trend", f"{tag:<8}{b['dur']:<6}{st:<8}{_tr_word(tr.get('st', tr['dir']))}"]
+    if ev["kind"] != "F":
+        side = 1 if ev["kind"] == "U" else -1 if ev["kind"] == "D" else (1 if ev["close"] > b["hi"] else -1)
+        rows += [f"{f'{m:g}x':<8}{_p(lv)}" for m, lv in _targets(b["lo"], b["hi"], side)]
+    return head + "\n<pre>" + "\n".join(rows) + "</pre>"
 
 
 # ───────────────────────── live con box status (one combined message, sent only on change) ─────────────────────────
@@ -510,71 +571,20 @@ def _hm(ms, with_date=False):
 
 
 def _status_block(name, now):
-    """(signature, text) for one index, from the last replay (+ the 1h MTF box line)."""
-    sig, txt = _status_core(name, now)
-    if MTF_ON and MTF.get(name):
-        txt += "\n" + MTF[name]
-    return sig, txt
-
-
-def _status_core(name, now):
+    """(signature, text):  📦 SENSEX · 11:05 · 84,120.50  +  Box / Time / Status"""
     recs, C, t = LAST.get("recs") or [], LAST.get("C") or [], LAST.get("t") or []
+    head = f"📦 <b>{name}</b> · {pd.Timestamp(now):%H:%M}" + (f" · {C[-1]:,.2f}" if C else "")
     boxes = [r for r in recs if not r["dead"] and r["rightIdx"] - r["leftIdx"] + 1 >= MIN_BARS]
+    hdr = f"{'Box':<8}{'Time':<6}Status"
     if not boxes or not C:
-        return (f"{name}|none", f"<b>{name} 5m · NO CON BOX yet</b>")
-    r = max(boxes, key=lambda x: (x["rightT"], x["firstT"]))          # latest box (latest activity), like TRIDENT
-    c, hi, lo = C[-1], r["hi"], r["lo"]
-    rg = hi - lo
-    today = pd.Timestamp(now).date()
-    first_day = pd.Timestamp(r["firstT"], unit="ms", tz=IST).date()
-    since = _hm(r["firstT"], first_day != today)
-
-    if r["live"]:
-        x = (c - lo) / rg if rg > 0 else 0
-        lvl = 1.0 if x >= 1 else 0.75 if x >= 0.75 else 0.5 if x >= 0.5 else 0.25 if x >= 0.25 else 0.0
-        rows = []
-        for g in (1.0, 0.75, 0.5, 0.25, 0.0):
-            tag = f"{g:g}".ljust(4)
-            mark = f"  ◀ live price {c:.2f}" if g == lvl else ""
-            rows.append(f"{tag} = {lo + rg * g:.2f}{mark}")
-        txt = "\n".join([f"<b>{name} 5m · INSIDE CON BOX · at {lvl:g}</b>",
-                         "<pre>" + "\n".join(rows) + "</pre>",
-                         f"Since {since} · running {_dur(r)}"])
-        return (f"{name}|IN|{r['firstT']}|{lvl}", txt)
-
-    # broken: TRIDENT label "1.5h U 1.6x" — U from the box low up, D from the box high down; B = side broken last
-    side = r["brk"] if r["brk"] in (1, -1) else -r["brk1"]
-    xm = (c - lo) / rg if side == 1 else (hi - c) / rg
-    lab = "U" if r["brk"] == 1 else "D" if r["brk"] == -1 else "B"
-    since_i = r.get("bIdx", -1) if r["brk"] == 2 else r.get("brkIdx", -1)
-    since_i = since_i if 0 <= since_i < len(C) else len(C) - 1
-    after = C[since_i:]
-    tg = []
-    for m in (1.5, 2.0, 2.5):
-        lv = lo + m * rg if side == 1 else hi - m * rg
-        hit = any(v >= lv for v in after) if side == 1 else any(v <= lv for v in after)
-        tg.append((m, lv, hit))
-    brk_i = r.get("brkIdx", -1)
-    brk_t = _hm(t[brk_i] + TF_MIN * 60000, pd.Timestamp(t[brk_i], unit="ms", tz=IST).date() != today) if 0 <= brk_i < len(t) else "-"
-    b_i = r.get("bIdx", -1)
-    b_txt = ""
-    if r["brk"] == 2 and 0 <= b_i < len(t):
-        b_txt = f" · then {'DOWN' if r['brk1'] == 1 else 'UP'} at " + \
-                _hm(t[b_i] + TF_MIN * 60000, pd.Timestamp(t[b_i], unit="ms", tz=IST).date() != today)
-    emo = "🟢" if side == 1 else "🔴"
-    if r["brk"] == 2:
-        emo = "🟣"
-    head = f"<b>{name} 5m · CON BOX BROKEN {_side_txt(r['brk'])} · {_dur(r)} {lab} · {xm:.2f}x</b>"
-    if first_day != today:
-        head = f"<b>{name} 5m · NO CON BOX TODAY</b>\nLast box ({first_day:%d %b}): broken {_side_txt(r['brk'])} · {_dur(r)} {lab} · {xm:.2f}x"
-    rows = [f"{m:g}x".ljust(4) + f" = {lv:.2f}" + (" ✓" if hit else "") for m, lv, hit in tg]
-    txt = "\n".join([f"{emo} {head}",
-                     f"Box {lo:.2f} – {hi:.2f} · broke {'UP' if r['brk1'] == 1 else 'DOWN'} at {brk_t}"
-                     + (f" (close {C[brk_i]:.2f})" if 0 <= brk_i < len(C) else "") + b_txt,
-                     f"Live price (last 5m close): {c:.2f}",
-                     "<pre>" + "\n".join(rows) + "</pre>"])
-    sig = f"{name}|BRK|{r['firstT']}|{r['brk']}|{''.join(str(int(h)) for _, _, h in tg)}|{first_day == today}"
-    return (sig, txt)
+        return (f"{name}|none", head + "\n<pre>" + hdr + "\n—</pre>")
+    r = max(boxes, key=lambda x: (x["rightT"], x["firstT"]))          # latest box, like TRIDENT
+    tag = box_tag(r, HBOX.get(name, []))
+    d = pd.Timestamp(r["firstT"], unit="ms", tz=IST).date()
+    if d != pd.Timestamp(now).date():
+        head += f" · box from {d:%d %b}"
+    st = "In" if r["live"] else {1: "U", -1: "D", 2: "B"}.get(r["brk"], "?")
+    return (f"{name}|{r['firstT']}|{st}|{tag}", head + "\n<pre>" + hdr + "\n" + f"{tag:<8}{_dur(r):<6}{st}" + "</pre>")
 
 
 def order_names(now):
@@ -596,23 +606,21 @@ def order_names(now):
 
 
 def send_status(state, now, send, edit=None):
-    """ONE combined NIFTY + SENSEX status message: a NEW message when any index's status changed;
-    otherwise the last one is edited (silent) every 5 min with the live price / 1h box line."""
+    """Index con box board: ONE message per day, edited silently every 5 min
+    (break / new box alerts with sound come from run())."""
     if not STATUS_ON or not STATUS:
         return 0
-    sig = " || ".join(STATUS[k][0] for k in sorted(STATUS))
     last = state.setdefault("_cbstat", {})
-    txt = "\n\n".join([f"📦 <b>CON BOX STATUS · {pd.Timestamp(now).strftime('%d %b %H:%M')}</b>"] +
-                       [STATUS[k][1] for k in order_names(now) if k in STATUS])
+    txt = "\n\n".join(STATUS[k][1] for k in order_names(now) if k in STATUS)
     today = pd.Timestamp(now).strftime("%Y-%m-%d")
-    if last.get("sig") == sig:
-        mid = last.get("mid")
-        if edit and mid and last.get("day") == today and last.get("text") != txt and edit(mid, txt):
+    mid = last.get("mid")
+    if mid and last.get("day") == today:
+        if last.get("text") == txt or (edit and edit(mid, txt)):
             last["text"] = txt
-        return 0
+            return 0
     mid = send(txt)
     if mid:
-        last.update(sig=sig, mid=mid if isinstance(mid, int) and mid > 0 else None, day=today, text=txt)
+        last.update(mid=mid if isinstance(mid, int) and mid > 0 else None, day=today, text=txt)
         return 1
     return 0
 
@@ -631,17 +639,19 @@ def _overlap_message(name, ev):
 
 # ───────────────────────── run (called from trident_star_alert.main) ─────────────────────────
 def run(name, m5, state, now, send):
-    if not (CB_ON or TREND_ON or CHAIN_ON or STATUS_ON):
+    if not (CB_ON or TREND_ON or CHAIN_ON or STATUS_ON or TCHG_ON):
         return 0
     closed = m5[[(_ms(x) + TF_MIN * 60000) <= _ms(now) for x in m5.index]]
     if len(closed) < 10:
         return 0
     if MTF_ON:
         try:
-            MTF[name] = mtf_line(mtf_status(closed, now, TICK.get(name, 0.05)), now)
+            MTF[name] = "1h box: " + mtf_short(mtf_status(closed, now, TICK.get(name, 0.05)))
+            HBOX[name] = mtf_boxes(closed, now, TICK.get(name, 0.05))
         except Exception as e:
             print(f"{name} 1h MTF box error {e}")
             MTF.pop(name, None)
+            HBOX.pop(name, None)
     events = replay(closed, TICK.get(name, 0.05))
     if STATUS_ON:
         STATUS[name] = _status_block(name, now)
@@ -654,10 +664,15 @@ def run(name, m5, state, now, send):
             continue
         if ev["kind"] in ("F", "U", "D", "B", "O") and not CB_ON:
             continue
+        if ev["kind"] == "O" and not OVL_ON:
+            continue
+        if ev["kind"] == "TC" and not TCHG_ON:
+            continue
         skey = f"{name}|cb5|{ev['key']}"
         if skey in state or ev["end"] < cutoff:
             continue
-        mid = send(message(name, ev))
+        tag = box_tag(ev["box"], HBOX.get(name, [])) if "box" in ev else "5m"
+        mid = send(message(name, ev, tag))
         if mid:
             state[skey] = now.isoformat()
             sent += 1

@@ -56,6 +56,7 @@ jobs:
           TREND_ALERTS: "0"       # old EMA trend alert off
           TREND_CHANGE_ALERTS: "1"  # 5m trend change: HH+HL = UP, LL+LH = DOWN (0 = off)
           CB_OVERLAP: "0"         # same-day con box overlap alert off
+          H1_BOX_ALERTS: "1"      # 1h box: 5m BREAK -> 1h CONFIRMED -> RE-IN, index + options (0 = off)
           HLLH_ALERTS: "1"        # 5m: 3+ HL / LH in a row, one LL / HH in between allowed (0 = off)
           OPTION_ALERTS: "1"        # options board ATM +-2 buy side; alert on new box / U / D; replies to typed strike / eob (0 = off)
           OPT_EOB_CONFIRM: "1"      # options EOB table, ATM +-2 (5 strikes) buy side with CE/PE + IN ticks (0 = off)

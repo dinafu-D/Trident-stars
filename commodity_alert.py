@@ -8,13 +8,14 @@ Source   : every option takes its direction from an MCX future —
            GOLD -> GOLD future | GOLDM -> GOLDM future | SILVER -> SILVER future | SILVERM -> SILVERM future
 Strikes  : GOLD / GOLDM ATM +-1 on round 1000 strikes | SILVER / SILVERM ATM +-2 on round 1000 strikes |
            crude / natural gas ATM +-2 (their own strike gap) — recalculated every 5 min
-Order    : nearest expiry first; same expiry -> the order you answer in the chat (default: normal before mini)
-Normal day : futures board (edited) + options boards / alerts / EOB table for every asset
-Expiry day : only the asset(s) expiring today: its own futures status message (new message on change,
-             old one deleted) + all futures alerts (con box, 1h box, trend, HL / LH, 1h EOB) + its options
+Shown    : ONE commodity at a time = the nearest expiry; several on that expiry -> the bot asks (no answer =
+           normal before mini); 'prio SILVERM' any time -> only that one for the day, 'prio auto' -> back
+Normal day : futures board (edited) + options boards / alerts / EOB table of that commodity
+Expiry day : its own futures status message (new message on change, old one deleted) + all futures
+             alerts (con box, 1h box, trend, HL / LH, 1h EOB) + its options
 Sound    : before 16:00 every message is silent
 Hours    : Mon-Fri 09:00-23:55 IST
-Typed    : eob | GOLDM 76000 | CRUDEOIL 6300CE | prio SILVERM | 2 1 (answer to the priority question)
+Typed    : eob | GOLDM 76000 | CRUDEOIL 6300CE | prio SILVERM | prio auto | 2 (answer to the question)
 """
 import json
 import os
@@ -165,56 +166,49 @@ def asset_exp(sym, c):
     return min(e) if e else "9999-12-31"
 
 
-def ordered(syms, c, state, today):
-    pr = state.get("_prio", {})
-    groups = pr.get("groups", {}) if pr.get("date") == today else {}
-
-    def key(s):
-        e = asset_exp(s, c)
-        g = groups.get(e)
-        rank = g.index(s) if g and s in g else (10 + (s in MINI) * 10 + SYMS.index(s))
-        return (e, rank)
-    return sorted(syms, key=key)
+def nearest_group(syms, c):
+    """Assets sharing the nearest expiry, normal before mini."""
+    if not syms:
+        return None, []
+    e = min(asset_exp(s, c) for s in syms)
+    return e, sorted([s for s in syms if asset_exp(s, c) == e], key=lambda s: ((s in MINI), SYMS.index(s)))
 
 
-def priority(state, c, today, replies):
-    """Ask once a day when expiries clash; read the answers ('2 1', 'prio SILVERM')."""
+def priority(state, c, today, replies, syms):
+    """ONE commodity at a time. Default: the nearest expiry; if several share it, the bot asks
+    (no answer = normal before mini). 'prio SILVERM' any time -> only that one for the rest of the day;
+    'prio auto' -> back to nearest expiry. Returns the chosen symbol."""
     pr = state.get("_prio", {})
     if pr.get("date") != today:
-        pr = dict(date=today, groups={}, asked={}, last=None)
-    by = {}
-    for s in SYMS:
-        if s in c["fut"] or s in c["opt"]:
-            by.setdefault(asset_exp(s, c), []).append(s)
-    # asked on the expiry day itself (other days: nearest expiry first, normal before mini)
-    clashes = {e: sorted(v, key=lambda s: ((s in MINI), SYMS.index(s))) for e, v in by.items() if len(v) > 1 and e == today}
+        pr = dict(date=today, pick=None, asked={}, last=None)
+    e, grp = nearest_group(syms, c)
     for q in replies:
         u = q.upper().strip()
         m = re.fullmatch(r"PRIO\s+(\w+)", u)
-        if m and m.group(1) in SYMS:
-            for e, g in clashes.items():
-                if m.group(1) in g:
-                    cur = pr["groups"].get(e, list(g))
-                    pr["groups"][e] = [m.group(1)] + [x for x in cur if x != m.group(1)]
-                    send(f"✅ Priority {pd.Timestamp(e):%d %b}: " + " › ".join(pr["groups"][e]))
+        if m:
+            w = m.group(1)
+            if w == "AUTO":
+                pr["pick"] = None
+                send("✅ Back to nearest expiry")
+            elif w in syms:
+                pr["pick"] = w
+                send(f"✅ Showing only <b>{w}</b> today (type <code>prio auto</code> to go back)")
+            else:
+                send(f"❓ {w} is not in the list: " + ", ".join(syms))
             continue
-        if re.fullmatch(r"[\d\s,]+", u) and pr.get("last") in clashes:
-            e = pr["last"]
-            g = clashes[e]
-            nums = [int(x) for x in re.findall(r"\d", u)]
-            pick = [g[n - 1] for n in nums if 1 <= n <= len(g)]
-            pr["groups"][e] = list(dict.fromkeys(pick + g))
-            send(f"✅ Priority {pd.Timestamp(e):%d %b}: " + " › ".join(pr["groups"][e]))
-    for e, g in sorted(clashes.items()):
-        if e not in pr["asked"]:
-            lines = [f"{i + 1}  {s}" for i, s in enumerate(g)]
-            mid = send(f"❓ <b>Same expiry {pd.Timestamp(e):%d %b}</b>\n<pre>" + "\n".join(lines) + "</pre>\n"
-                       f"Reply the order, e.g. {' '.join(str(i + 1) for i in range(len(g)))}  "
-                       f"(no answer by 17:00 = normal before mini)")
-            pr["asked"][e] = mid or 0
-            pr["last"] = e
-            break                                               # one question at a time
+        if re.fullmatch(r"[\d\s,]+", u) and pr.get("last") == e and len(grp) > 1:
+            n = int(re.findall(r"\d", u)[0])
+            if 1 <= n <= len(grp):
+                pr["pick"] = grp[n - 1]
+                send(f"✅ Showing only <b>{grp[n - 1]}</b> today")
+    if len(grp) > 1 and e not in pr["asked"] and not pr["pick"]:
+        lines = [f"{i + 1}  {s}" for i, s in enumerate(grp)]
+        mid = send(f"❓ <b>Same expiry {pd.Timestamp(e):%d %b}</b> — which one?\n<pre>" + "\n".join(lines) + "</pre>\n"
+                   f"Reply the number (no answer = {grp[0]})")
+        pr["asked"][e] = mid or 0
+        pr["last"] = e
     state["_prio"] = pr
+    return pr["pick"] if pr["pick"] in syms else (grp[0] if grp else None)
 
 
 # ───────────────────────── helpers ─────────────────────────
@@ -419,7 +413,7 @@ def answer(q, c, found, idxinfo, state, now, cache):
     if not m or m.group(1) not in c["opt"]:
         if u in ("HELP", "/HELP", "/START"):
             send("Type: <code>eob</code> · <code>GOLDM 76000</code> · <code>CRUDEOIL 6300CE</code> · "
-                 "<code>prio SILVERM</code>")
+                 "<code>prio SILVERM</code> · <code>prio auto</code>")
         return
     key, k = m.group(1), int(m.group(2))
     ser = c["opt"][key]
@@ -460,11 +454,11 @@ def main():
     today = now.strftime("%Y-%m-%d")
     replies = asks(state)
     c = load_contracts(now)
-    priority(state, c, today, [q for q in replies if re.fullmatch(r"(?i)prio\s+\w+|[\d\s,]+", q.strip())])
     syms = [s for s in SYMS if s in c["fut"] or s in c["opt"]]
-    expiring = [s for s in syms if asset_exp(s, c) == today]
-    active = ordered(expiring or syms, c, state, today)
-    print(f"commodity: {'EXPIRY DAY ' + str(expiring) if expiring else 'normal day'}, order {active}")
+    pick = priority(state, c, today, [q for q in replies if re.fullmatch(r"(?i)prio\s+\w+|[\d\s,]+", q.strip())], syms)
+    active = [pick] if pick else []
+    expiring = [s for s in active if asset_exp(s, c) == today]
+    print(f"commodity: showing {active} ({'EXPIRY DAY' if expiring else 'normal day'})")
 
     # futures (sources + board)
     need = set(active) | {SOURCE[s] for s in active}
@@ -522,6 +516,11 @@ def main():
                 O._post_board(state, key, boards[key], now, send, edit, delete, moved=key in changed)
             except Exception as e:
                 print(f"{key} board: {e}")
+    bd = state.get("_optboard", {})
+    for name in [n for n in bd if n != "_FUT" and n not in keys]:   # switched commodity: remove its old board
+        if bd[name].get("mid"):
+            delete(bd[name]["mid"])
+        bd.pop(name)
     for q in replies:
         if re.fullmatch(r"(?i)prio\s+\w+|[\d\s,]+", q.strip()):
             continue

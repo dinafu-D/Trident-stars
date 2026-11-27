@@ -195,16 +195,23 @@ def _brow(label, s):
     return f"{label:<9}{s['tag']:<8}{s['dur']:<6}{s['st']}"
 
 
+SRC = {}          # name -> "Spot NIFTY 25,742.30" / "Source CRUDEOIL 18DEC FUT · 6,321.50" (current run)
+
+
+def _src_line(name):
+    return f"\n{SRC[name]}" if SRC.get(name) else ""
+
+
 def _upd(now):
     """start time of the last closed 5m candle"""
     t = pd.Timestamp(now).floor("5min") - pd.Timedelta(minutes=5)
     return t.strftime("%H:%M")
 
 
-def _al_text(head, rows, upd=None):
-    """🔔 alert table: Strike / Box / Time / Status (NEW, U, D, RE-IN)"""
+def _al_text(head, rows, upd=None, src=None):
+    """🔔 alert table: Strike / Box / Time / Status (NEW, U, D, RE-IN) + source / spot line"""
     hdr = f"{'Strike':<9}{'Box':<8}{'Time':<6}Status"
-    return head + (f" · upd {upd}" if upd else "") + "\n<pre>" + "\n".join([hdr] + [f"{r['label']:<9}{r['tag']:<8}{r['dur']:<6}{r['lab']}"
+    return head + (f" · upd {upd}" if upd else "") + (f"\n{src}" if src else "") + "\n<pre>" + "\n".join([hdr] + [f"{r['label']:<9}{r['tag']:<8}{r['dur']:<6}{r['lab']}"
                                                   for r in rows]) + "</pre>"
 
 
@@ -292,7 +299,7 @@ def _eobc_message(rows, now):
         groups.setdefault((row["name"], row["dir"]), []).append(row)
     for (name, d), rs in groups.items():
         buy, opp = ("PE", "CE") if d == -1 else ("CE", "PE")
-        head = f"🔱 <b>{name} · EOB · {'⬇ PE' if d == -1 else '⬆ CE'}</b> · upd {_upd(now)}"
+        head = f"🔱 <b>{name} · EOB · {'⬇ PE' if d == -1 else '⬆ CE'}</b> · upd {_upd(now)}" + _src_line(name)
         lines = [f"{'Strike':<8}{buy:<12}{'Time':<7}{opp:<4}IN"] + _eob_rows(rs)
         out.append(head + "\n<pre>" + "\n".join(lines) + "</pre>")
     return "\n\n".join(out)
@@ -404,6 +411,7 @@ def run(m5_by_name, state, now, send, fetch_option, edit=None, asks=None, delete
         if closed.empty:
             continue
         spot = float(closed["Close"].iloc[-1])
+        SRC[name] = f"Spot {name} {spot:,.2f}"
         atm = int(round(spot / step)) * step                 # recalculated every check
         idx_dir, _ = _index_dir(m5, now)
         if EOBC_ON:
@@ -449,23 +457,23 @@ def run(m5_by_name, state, now, send, fetch_option, edit=None, asks=None, delete
                     elif st["firstT"] == prev.get("firstT") and st["st"] in ("U", "D") and st["st"] != prev.get("st"):
                         al.append(dict(row, lab=st["st"], active=False))                # broke up / down
                     elif st["firstT"] == prev.get("firstT") and st["st"] == "In" and prev.get("st") in ("U", "D"):
-                        al.append(dict(row, lab="RE-IN", active=True))                  # broken box re-entered
+                        al.append(dict(row, lab="RE-IN " + prev.get("st"), active=True))  # re-entered (side it broke)
                 if st:
                     last_st[key] = dict(day=today, firstT=st["firstT"], st=st["st"])
                 # the option's own 1h box: 5m close broke it / 1h close confirmed / back inside
                 if st and st.get("h") and H1_ALERTS:
                     evs, hcur = CB.h1_transitions(h1st.get(key), st["h"])
                     for e in evs:
-                        lab = f"{e[2]} 5m" if e.startswith("5m") else f"{e[2]} 1h ✅" if e.startswith("1h") else "RE-IN"
+                        lab = f"{e[2]} 5m" if e.startswith("5m") else f"{e[2]} 1h ✅" if e.startswith("1h") else e
                         h1rows.append(dict(key=key, label=f"{k}{typ}", dur=st["h"]["dur"], lab=lab,
                                            reply=hcur.get("mid") if e.startswith("1h") else None, ev=e))
                     h1st[key] = hcur
         arrow = "⬇ PE" if idx_dir == -1 else "⬆ CE" if idx_dir == 1 else "CE + PE"
         hdr = f"{'Strike':<9}{'Box':<8}{'Time':<6}Status"
-        boards[name] = f"📊 <b>{name} OPTIONS · {_upd(now)} · {arrow}</b>\n<pre>" + \
+        boards[name] = f"📊 <b>{name} OPTIONS · {_upd(now)} · {arrow}</b>" + _src_line(name) + "\n<pre>" + \
             "\n".join([hdr] + (board or ["—"])) + "</pre>"
         if al:
-            alerts.append((f"🔔 <b>{name} OPTIONS · {_upd(now)}</b>", al))
+            alerts.append((f"🔔 <b>{name} OPTIONS · {_upd(now)}</b>", al, name))
             changed.add(name)
         if h1rows:
             changed.add(name)
@@ -473,7 +481,7 @@ def run(m5_by_name, state, now, send, fetch_option, edit=None, asks=None, delete
             body = [f"{'Strike':<9}{'Box':<5}{'Time':<6}Status"] + \
                    [f"{r['label']:<9}{'1h':<5}{r['dur']:<6}{r['lab']}" for r in h1rows]
             rto = next((r["reply"] for r in h1rows if r["reply"]), None)
-            mid = send(f"🔔 <b>{name} OPTIONS · 1h BOX · {when}</b>\n<pre>" + "\n".join(body) + "</pre>", reply_to=rto)
+            mid = send(f"🔔 <b>{name} OPTIONS · 1h BOX · {when}</b>" + _src_line(name) + "\n<pre>" + "\n".join(body) + "</pre>", reply_to=rto)
             if mid:
                 sent += 1
                 for r in h1rows:                                     # remember the 5m-break message for replies
@@ -485,12 +493,12 @@ def run(m5_by_name, state, now, send, fetch_option, edit=None, asks=None, delete
     for mid in [m for m, v in alst.items() if v.get("day") != today]:
         alst.pop(mid)
     just = set()
-    for head, rows in alerts:
-        mid = send(_al_text(head, rows))
+    for head, rows, nm in alerts:
+        mid = send(_al_text(head, rows, src=SRC.get(nm)))
         if mid:
             sent += 1
             if isinstance(mid, int) and mid > 0 and any(r["active"] for r in rows):
-                alst[str(mid)] = dict(day=today, head=head, rows=rows)
+                alst[str(mid)] = dict(day=today, head=head, rows=rows, name=nm)
                 just.add(str(mid))
     # live edit: rows still inside their box get the new Time / Box every 5 min; frozen once they break
     for mid, v in alst.items():
@@ -505,11 +513,9 @@ def run(m5_by_name, state, now, send, fetch_option, edit=None, asks=None, delete
                 r.update(tag=c["tag"], dur=c["dur"])
             else:
                 r["active"] = False
-        txt = _al_text(v["head"], v["rows"], upd=_upd(now))
-        if any(r["active"] for r in v["rows"]) and edit:
+        txt = _al_text(v["head"], v["rows"], upd=_upd(now), src=SRC.get(v.get("name")))
+        if edit and (any(r["active"] for r in v["rows"]) or txt != old):
             edit(int(mid), txt)
-        elif txt != old and edit:
-            edit(int(mid), _al_text(v["head"], v["rows"], upd=_upd(now)))
     for mid in [m for m, v in alst.items() if not any(r["active"] for r in v["rows"])]:
         alst.pop(mid)
     if EOBC_ON:

@@ -285,13 +285,14 @@ def expiry_status(sym, df, now, state):
 
 
 # ───────────────────────── options (one series) ─────────────────────────
-def series(key, ser, src, now, state, found, idxinfo, boards, alerts, changed, cache):
+def series(key, ser, src, now, state, found, idxinfo, boards, alerts, changed, cache, srcname=""):
     """Board rows + NEW / U / D / RE-IN alerts + 1h box alerts for one option series (like the index options)."""
     today = pd.Timestamp(now).strftime("%Y-%m-%d")
     closed = src[[(x + pd.Timedelta(minutes=5)) <= now for x in src.index]]
     if closed.empty:
         return
     spot = float(closed["Close"].iloc[-1])
+    O.SRC[key] = f"Source {srcname} · {spot:,.2f}"
     d, _ = O._index_dir(src, now)
     try:
         idxinfo[key] = (d, O._idx_eobs(src, now))
@@ -344,17 +345,17 @@ def series(key, ser, src, now, state, found, idxinfo, boards, alerts, changed, c
                 h1st[sk] = hcur
     arrow = "⬇ PE" if d == -1 else "⬆ CE" if d == 1 else "CE + PE"
     hdr = f"{'Strike':<9}{'Box':<8}{'Time':<6}Status"
-    boards[key] = (f"📊 <b>{key} OPTIONS · {O._upd(now)} · exp {dmy(ser['expiry'])} · {arrow}</b>\n<pre>"
+    boards[key] = (f"📊 <b>{key} OPTIONS · {O._upd(now)} · exp {dmy(ser['expiry'])} · {arrow}</b>" + O._src_line(key) + "\n<pre>"
                    + "\n".join([hdr] + (board or ["—"])) + "</pre>")
     if al:
-        alerts.append((f"🔔 <b>{key} OPTIONS · {O._upd(now)}</b>", al))
+        alerts.append((f"🔔 <b>{key} OPTIONS · {O._upd(now)}</b>", al, key))
         changed.add(key)
     if h1rows:
         changed.add(key)
         body = [f"{'Strike':<9}{'Box':<5}{'Time':<6}Status"] + \
                [f"{r['label']:<9}{'1h':<5}{r['dur']:<6}{r['lab']}" for r in h1rows]
         rto = next((r["reply"] for r in h1rows if r["reply"]), None)
-        mid = send(f"🔔 <b>{key} OPTIONS · 1h BOX · {O._upd(now)}</b>\n<pre>" + "\n".join(body) + "</pre>", reply_to=rto)
+        mid = send(f"🔔 <b>{key} OPTIONS · 1h BOX · {O._upd(now)}</b>" + O._src_line(key) + "\n<pre>" + "\n".join(body) + "</pre>", reply_to=rto)
         if mid and isinstance(mid, int) and mid > 0:
             for r in h1rows:
                 if r["ev"].startswith("5m"):
@@ -369,12 +370,12 @@ def send_alerts(alerts, state, now):
     for mid in [m for m, v in alst.items() if v.get("day") != today]:
         alst.pop(mid)
     sent, just = 0, set()
-    for head, rows in alerts:
-        mid = send(O._al_text(head, rows))
+    for head, rows, nm in alerts:
+        mid = send(O._al_text(head, rows, src=O.SRC.get(nm)))
         if mid:
             sent += 1
             if isinstance(mid, int) and mid > 0 and any(r["active"] for r in rows):
-                alst[str(mid)] = dict(day=today, head=head, rows=rows)
+                alst[str(mid)] = dict(day=today, head=head, rows=rows, name=nm)
                 just.add(str(mid))
     cur = state.get("_cur", {})
     for mid, v in alst.items():
@@ -388,7 +389,7 @@ def send_alerts(alerts, state, now):
                 r.update(tag=c["tag"], dur=c["dur"])
             else:
                 r["active"] = False
-        edit(int(mid), O._al_text(v["head"], v["rows"], upd=O._upd(now)))
+        edit(int(mid), O._al_text(v["head"], v["rows"], upd=O._upd(now), src=O.SRC.get(v.get("name"))))
     for mid in [m for m, v in alst.items() if not any(r["active"] for r in v["rows"])]:
         alst.pop(mid)
     return sent
@@ -492,7 +493,9 @@ def main():
             print(f"{key}: no source future data")
             continue
         try:
-            series(key, c["opt"][key], src, now, state, found, idxinfo, boards, alerts, changed, cache)
+            sf = SOURCE[c["opt"][key]["sym"]]
+            sname = f"{sf} {pd.Timestamp(c['fut'][sf]['expiry']):%d%b}".upper() + " FUT" + (" (MCX)" if key.startswith("NSE ") else "")
+            series(key, c["opt"][key], src, now, state, found, idxinfo, boards, alerts, changed, cache, sname)
         except Exception as e:
             print(f"{key} options: {e}")
     sent += send_alerts(alerts, state, now)

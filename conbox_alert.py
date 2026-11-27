@@ -33,6 +33,7 @@ CB_ON = os.getenv("CONBOX_ALERTS", "1") == "1"
 TREND_ON = os.getenv("TREND_ALERTS", "0") == "1"       # old EMA trend alert (off)
 TCHG_ON = os.getenv("TREND_CHANGE_ALERTS", "1") == "1"  # trend change: HH+HL = UP, LL+LH = DOWN (one opposite swing allowed)
 OVL_ON = os.getenv("CB_OVERLAP", "0") == "1"            # same-day con box overlap alert (off)
+H1_ALERTS = os.getenv("H1_BOX_ALERTS", "1") == "1"      # 1h box: 5m BREAK -> 1h CONFIRMED -> RE-IN
 CHAIN_ON = os.getenv("HLLH_ALERTS", "1") == "1"         # 3+ HL / LH in a row (one LL / HH in between allowed)
 CHAIN_MIN = 3
 TICK = {"NIFTY": 0.05, "SENSEX": 0.01}
@@ -555,7 +556,7 @@ def message(name, ev, tag="5m"):
     if ev.get("edited"):
         st = "In"
     title = {"F": "NEW BOX", "R": "RE-IN"}.get(ev["kind"], "BREAK")
-    head = f"🔔 <b>{name} 5m · {title} · {when}</b>"
+    head = f"🔔 <b>{name} 5m · {title} · {when}</b>" + (f" · upd {ev['upd']}" if ev.get("upd") else "")
     rows = [f"{'Box':<8}{'Time':<6}{'Status':<8}Trend", f"{tag:<8}{b['dur']:<6}{st:<8}{_tr_word(tr.get('st', tr['dir']))}"]
     if ev["kind"] not in ("F", "R"):
         side = 1 if ev["kind"] == "U" else -1 if ev["kind"] == "D" else (1 if ev["close"] > b["hi"] else -1)
@@ -608,9 +609,9 @@ def order_names(now):
     return ["SENSEX", "NIFTY"] if wd in (2, 3) else ["NIFTY", "SENSEX"]
 
 
-def send_status(state, now, send, edit=None):
-    """Index con box board: ONE message per day, edited silently every 5 min
-    (break / new box alerts with sound come from run())."""
+def send_status(state, now, send, edit=None, delete=None, moved=False):
+    """Index con box board: ONE message, edited silently every 5 min. When an alert was sent this run
+    (moved=True) the old board is deleted and a fresh one is sent silently, so it stays at the bottom."""
     if not STATUS_ON or not STATUS:
         return 0
     last = state.setdefault("_cbstat", {})
@@ -618,10 +619,15 @@ def send_status(state, now, send, edit=None):
     today = pd.Timestamp(now).strftime("%Y-%m-%d")
     mid = last.get("mid")
     if mid and last.get("day") == today:
-        if last.get("text") == txt or (edit and edit(mid, txt)):
+        if moved and delete:
+            delete(mid)
+        elif last.get("text") == txt or (edit and edit(mid, txt)):
             last["text"] = txt
             return 0
-    mid = send(txt)
+    try:
+        mid = send(txt, silent=True)
+    except TypeError:
+        mid = send(txt)
     if mid:
         last.update(mid=mid if isinstance(mid, int) and mid > 0 else None, day=today, text=txt)
         return 1
@@ -663,6 +669,8 @@ def _lifecycle(name, state, now, send, edit, new_mids):
         nm = new_mids.get(r["firstT"])
         lc = dict(day=today, firstT=r["firstT"], st=st, rein=False,
                   mid=nm[0] if nm else None, kind="F", end=nm[1] if nm else endnow, text=None)
+        lcs[name] = lc
+        return sent                                   # just sent (or first look): start editing next run
     else:
         prev = lc["st"]
         if prev in ("U", "D") and st == "In":                       # broken box re-entered
@@ -672,6 +680,9 @@ def _lifecycle(name, state, now, send, edit, new_mids):
             if mid:
                 sent += 1
                 lc.update(rein=True, mid=mid, kind="R", end=endnow, text=txt)
+                lc["st"] = st
+                lcs[name] = lc
+                return sent
         elif lc.get("rein") and prev == "In" and st in ("U", "D"):   # breaks again after re-entry
             if r["firstT"] not in new_mids.get("_brk", set()):        # not already sent as a TRIDENT U/D/B now
                 ev = dict(kind=st, box=box, trend=tr, end=endnow, close=c)
@@ -682,13 +693,75 @@ def _lifecycle(name, state, now, send, edit, new_mids):
     # live edit of the NEW / RE-IN alert while inside; freeze once it breaks
     if lc.get("mid") and isinstance(lc["mid"], int) and lc["mid"] > 0:
         if st == "In":
-            ev = dict(kind=lc["kind"], box=box, trend=tr, end=lc["end"], close=c, edited=True)
+            ev = dict(kind=lc["kind"], box=box, trend=tr, end=lc["end"], close=c, edited=True,
+                      upd=pd.Timestamp(endnow - TF_MIN * 60000, unit="ms", tz=IST).strftime("%H:%M"))
             txt = message(name, ev, tag)
             if txt != lc.get("text") and edit and edit(lc["mid"], txt):
                 lc["text"] = txt
         else:
             lc["mid"] = None
     lcs[name] = lc
+    return sent
+
+
+def h1_side(st):
+    """5m close vs the 1h box: 'U' / 'D' / 'In'"""
+    return "U" if st["close"] > st["hi"] else "D" if st["close"] < st["lo"] else "In"
+
+
+def h1_transitions(prev, st):
+    """1h box changes for one chart. prev = stored dict or None. Returns (events, new stored dict).
+    events: '5mU' / '5mD' (5m close broke the 1h box), '1hU' / '1hD' (1h close confirmed), 'RE-IN'."""
+    s5 = h1_side(st)
+    conf = st["side"] if not st["live"] and st["side"] in (1, -1) else 0
+    cur = dict(firstT=st["firstT"], s5=s5, conf=0, mid=None)
+    if not prev or prev.get("firstT") != st["firstT"]:
+        cur["conf"] = conf                                   # new box / first look: nothing to alert
+        return [], cur
+    cur.update(conf=prev.get("conf", 0), mid=prev.get("mid"))
+    ev = []
+    if s5 in ("U", "D") and prev["s5"] != s5:
+        ev.append("5m" + s5)
+    elif s5 == "In" and prev["s5"] in ("U", "D"):
+        ev.append("RE-IN")
+    if conf and not cur["conf"] and s5 == ("U" if conf == 1 else "D"):
+        ev.append("1h" + s5)
+        cur["conf"] = conf
+    if s5 == "In" and not conf:
+        cur["conf"] = 0
+    return ev, cur
+
+
+def _h1_alerts(name, closed, state, now, send):
+    """Index 1h MTF box: 5m BREAK -> 1h CONFIRMED (reply) -> RE-IN."""
+    st = mtf_status(closed, now, TICK.get(name, 0.05))
+    if not st:
+        return 0
+    lcs = state.setdefault("_h1lc", {})
+    evs, cur = h1_transitions(lcs.get(name), st)
+    tr = (LAST.get("tr") or {}).get("st", 0)
+    endnow = _ms(now) - (_ms(now) % (TF_MIN * 60000))
+    when = pd.Timestamp(endnow - TF_MIN * 60000, unit="ms", tz=IST).strftime("%H:%M")
+    sent = 0
+    for e in evs:
+        if e.startswith("5m"):
+            side = 1 if e == "5mU" else -1
+            rows = [f"{'Box':<6}{'Time':<6}{'Status':<8}Trend", f"{'1h':<6}{st['dur']:<6}{e[2]:<8}{_tr_word(tr)}"]
+            rows += [f"{f'{m:g}x':<6}{_p(lv)}" for m, lv in _targets(st["lo"], st["hi"], side)]
+            mid = send(f"🔔 <b>{name} 1h BOX · 5m BREAK · {when}</b>\n<pre>" + "\n".join(rows) + "</pre>")
+            if mid:
+                cur["mid"] = mid if isinstance(mid, int) and mid > 0 else None
+        elif e.startswith("1h"):
+            bt = pd.Timestamp(st["brk_t"], unit="ms", tz=IST).strftime("%H:%M") if st.get("brk_t") else when
+            rows = [f"{'Box':<6}{'Time':<6}Status", f"{'1h':<6}{st['dur']:<6}{e[2]}"]
+            mid = send(f"✅ <b>{name} 1h BOX · 1h CONFIRMED · {bt}</b>\n<pre>" + "\n".join(rows) + "</pre>",
+                       reply_to=cur.get("mid"))
+        else:
+            rows = [f"{'Box':<6}{'Time':<6}Status", f"{'1h':<6}{st['dur']:<6}In"]
+            mid = send(f"🔔 <b>{name} 1h BOX · RE-IN · {when}</b>\n<pre>" + "\n".join(rows) + "</pre>")
+            cur["mid"] = None
+        sent += 1 if mid else 0
+    lcs[name] = cur
     return sent
 
 
@@ -740,6 +813,11 @@ def run(name, m5, state, now, send, edit=None):
             sent += _lifecycle(name, state, now, send, edit, new_mids)
         except Exception as e:
             print(f"{name} con box live update error {e}")
+    if CB_ON and H1_ALERTS:
+        try:
+            sent += _h1_alerts(name, closed, state, now, send)
+        except Exception as e:
+            print(f"{name} 1h box alert error {e}")
     print(f"{name} 5m con box / HL-LH: {sum(e['kind'] == 'F' for e in events)} boxes, "
           f"{sum(e['kind'] in ('HL', 'LH') for e in events)} HL/LH chain alerts in history, sent {sent}"
           + (f" | {MTF[name]}" if MTF.get(name) else ""))

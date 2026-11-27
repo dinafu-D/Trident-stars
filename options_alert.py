@@ -32,6 +32,7 @@ SIDE_N = int(os.getenv("OPT_STRIKES_EACH_SIDE", "2"))  # con box board: ATM +-2 
 CFG = {"NIFTY": dict(exch="NSE", seg="NSE_FNO", prefix="NIFTY-", step=50),
        "SENSEX": dict(exch="BSE", seg="BSE_FNO", prefix="SENSEX-", step=100)}
 EOBC_ON = os.getenv("OPT_EOB_CONFIRM", "1") == "1"
+H1_ALERTS = os.getenv("H1_BOX_ALERTS", "1") == "1"   # option's own 1h box: 5m break / 1h confirmed / RE-IN
 EOBC_SIDE = int(os.getenv("OPT_EOB_STRIKES_EACH_SIDE", "2"))   # ATM +-2 = 5 strikes
 SCRIP_MASTER = "https://images.dhan.co/api-data/api-scrip-master.csv"
 
@@ -179,7 +180,12 @@ def strike_state(df, now):
         tag = "5m"
     c = C[-1]
     st = "In" if r["live"] or r["lo"] <= c <= r["hi"] else ("U" if c > r["hi"] else "D")
-    return dict(tag=tag, dur=CB._dur(r), st=st, firstT=r["firstT"], today=bool(tb))
+    try:
+        h = CB.mtf_status(dfc, now, 0.05)                   # the option's own 1h box (for 1h box alerts)
+    except Exception as e:
+        print(f"options 1h status: {e}")
+        h = None
+    return dict(tag=tag, dur=CB._dur(r), st=st, firstT=r["firstT"], today=bool(tb), h=h)
 
 
 def _brow(label, s):
@@ -189,24 +195,37 @@ def _brow(label, s):
     return f"{label:<9}{s['tag']:<8}{s['dur']:<6}{s['st']}"
 
 
-def _al_text(head, rows):
+def _upd(now):
+    """start time of the last closed 5m candle"""
+    t = pd.Timestamp(now).floor("5min") - pd.Timedelta(minutes=5)
+    return t.strftime("%H:%M")
+
+
+def _al_text(head, rows, upd=None):
     """🔔 alert table: Strike / Box / Time / Status (NEW, U, D, RE-IN)"""
     hdr = f"{'Strike':<9}{'Box':<8}{'Time':<6}Status"
-    return head + "\n<pre>" + "\n".join([hdr] + [f"{r['label']:<9}{r['tag']:<8}{r['dur']:<6}{r['lab']}"
+    return head + (f" · upd {upd}" if upd else "") + "\n<pre>" + "\n".join([hdr] + [f"{r['label']:<9}{r['tag']:<8}{r['dur']:<6}{r['lab']}"
                                                   for r in rows]) + "</pre>"
 
 
-def _post_board(state, name, txt, now, send, edit):
+def _post_board(state, name, txt, now, send, edit, delete=None, moved=False):
+    """One board per day, edited silently. moved=True (something was sent this run): delete the old board
+    and send a fresh one silently, so the board stays at the bottom of the chat."""
     bd = state.setdefault("_optboard", {})
     today = pd.Timestamp(now).strftime("%Y-%m-%d")
     cur = bd.get(name)
     if cur and cur.get("day") == today and cur.get("mid"):
-        if cur.get("text") == txt:
+        if moved and delete:
+            delete(cur["mid"])
+        elif cur.get("text") == txt:
             return 0
-        if edit and edit(cur["mid"], txt):
+        elif edit and edit(cur["mid"], txt):
             cur["text"] = txt
             return 0
-    mid = send(txt)
+    try:
+        mid = send(txt, silent=True)
+    except TypeError:
+        mid = send(txt)
     if mid:
         bd[name] = dict(day=today, mid=mid if isinstance(mid, int) and mid > 0 else None, text=txt)
         return 1
@@ -273,7 +292,7 @@ def _eobc_message(rows, now):
         groups.setdefault((row["name"], row["dir"]), []).append(row)
     for (name, d), rs in groups.items():
         buy, opp = ("PE", "CE") if d == -1 else ("CE", "PE")
-        head = f"🔱 <b>{name} · EOB · {'⬇ PE' if d == -1 else '⬆ CE'}</b>"
+        head = f"🔱 <b>{name} · EOB · {'⬇ PE' if d == -1 else '⬆ CE'}</b> · upd {_upd(now)}"
         lines = [f"{'Strike':<8}{buy:<12}{'Time':<7}{opp:<4}IN"] + _eob_rows(rs)
         out.append(head + "\n<pre>" + "\n".join(lines) + "</pre>")
     return "\n\n".join(out)
@@ -361,7 +380,7 @@ def _ask_reply(name, k, types, contracts, fetch_option, now, cache):
     return head + "\n<pre>" + "\n".join(body) + "</pre>"
 
 
-def run(m5_by_name, state, now, send, fetch_option, edit=None, asks=None):
+def run(m5_by_name, state, now, send, fetch_option, edit=None, asks=None, delete=None):
     """Called once per check after the index loop. fetch_option(seg, security_id, now) -> 5m DataFrame (few days).
     asks: texts typed to the options bot since the last run ('eob', '84000', '84000PE')."""
     if not OPT_ON:
@@ -376,7 +395,8 @@ def run(m5_by_name, state, now, send, fetch_option, edit=None, asks=None):
     last_st = state.setdefault("_optst", {})
     today = pd.Timestamp(now).strftime("%Y-%m-%d")
     names = [n for n in order_names(now) if n in contracts and n in m5_by_name]
-    cache, cur = {}, {}
+    cache, cur, boards, changed = {}, {}, {}, set()
+    h1st = state.setdefault("_opt1h", {})
     for name in names:
         step = CFG[name]["step"]
         m5 = m5_by_name[name]
@@ -394,7 +414,7 @@ def run(m5_by_name, state, now, send, fetch_option, edit=None, asks=None):
         strikes = [atm + j * step for j in range(-SIDE_N, SIDE_N + 1)]
         eob_new = {atm + j * step for j in range(-EOBC_SIDE, EOBC_SIDE + 1)}
         buy = ("PE",) if idx_dir == -1 else ("CE",) if idx_dir == 1 else ("CE", "PE")
-        board, al = [], []
+        board, al, h1rows = [], [], []
         for k in sorted(set(strikes) | eob_new | want.get(name, set())):
             for typ in ("CE", "PE"):
                 sid = contracts[name]["map"].get(f"{k}{typ}")
@@ -432,16 +452,33 @@ def run(m5_by_name, state, now, send, fetch_option, edit=None, asks=None):
                         al.append(dict(row, lab="RE-IN", active=True))                  # broken box re-entered
                 if st:
                     last_st[key] = dict(day=today, firstT=st["firstT"], st=st["st"])
+                # the option's own 1h box: 5m close broke it / 1h close confirmed / back inside
+                if st and st.get("h") and H1_ALERTS:
+                    evs, hcur = CB.h1_transitions(h1st.get(key), st["h"])
+                    for e in evs:
+                        lab = f"{e[2]} 5m" if e.startswith("5m") else f"{e[2]} 1h ✅" if e.startswith("1h") else "RE-IN"
+                        h1rows.append(dict(key=key, label=f"{k}{typ}", dur=st["h"]["dur"], lab=lab,
+                                           reply=hcur.get("mid") if e.startswith("1h") else None, ev=e))
+                    h1st[key] = hcur
         arrow = "⬇ PE" if idx_dir == -1 else "⬆ CE" if idx_dir == 1 else "CE + PE"
         hdr = f"{'Strike':<9}{'Box':<8}{'Time':<6}Status"
-        txt = f"📊 <b>{name} OPTIONS · {pd.Timestamp(now):%H:%M} · {arrow}</b>\n<pre>" + \
-              "\n".join([hdr] + (board or ["—"])) + "</pre>"
-        try:
-            sent += _post_board(state, name, txt, now, send, edit)
-        except Exception as e:
-            print(f"options {name} board: {e}")
+        boards[name] = f"📊 <b>{name} OPTIONS · {_upd(now)} · {arrow}</b>\n<pre>" + \
+            "\n".join([hdr] + (board or ["—"])) + "</pre>"
         if al:
-            alerts.append((f"🔔 <b>{name} OPTIONS · {pd.Timestamp(now):%H:%M}</b>", al))
+            alerts.append((f"🔔 <b>{name} OPTIONS · {_upd(now)}</b>", al))
+            changed.add(name)
+        if h1rows:
+            changed.add(name)
+            when = _upd(now)
+            body = [f"{'Strike':<9}{'Box':<5}{'Time':<6}Status"] + \
+                   [f"{r['label']:<9}{'1h':<5}{r['dur']:<6}{r['lab']}" for r in h1rows]
+            rto = next((r["reply"] for r in h1rows if r["reply"]), None)
+            mid = send(f"🔔 <b>{name} OPTIONS · 1h BOX · {when}</b>\n<pre>" + "\n".join(body) + "</pre>", reply_to=rto)
+            if mid:
+                sent += 1
+                for r in h1rows:                                     # remember the 5m-break message for replies
+                    if r["ev"].startswith("5m") and isinstance(mid, int) and mid > 0:
+                        h1st[r["key"]]["mid"] = mid
         log.append(f"{name} ATM {atm} ({len(al)} alerts)")
     print("options: " + ", ".join(log))
     alst = state.setdefault("_optal", {})
@@ -468,16 +505,27 @@ def run(m5_by_name, state, now, send, fetch_option, edit=None, asks=None):
                 r.update(tag=c["tag"], dur=c["dur"])
             else:
                 r["active"] = False
-        txt = _al_text(v["head"], v["rows"])
-        if txt != old and edit:
+        txt = _al_text(v["head"], v["rows"], upd=_upd(now))
+        if any(r["active"] for r in v["rows"]) and edit:
             edit(int(mid), txt)
+        elif txt != old and edit:
+            edit(int(mid), _al_text(v["head"], v["rows"], upd=_upd(now)))
     for mid in [m for m, v in alst.items() if not any(r["active"] for r in v["rows"])]:
         alst.pop(mid)
     if EOBC_ON:
         try:
-            sent += run_eob_confirm(found, idxinfo, state, now, send, edit, names)
+            n_eob = run_eob_confirm(found, idxinfo, state, now, send, edit, names)
+            sent += n_eob
+            if n_eob:
+                changed.update(names)
         except Exception as e:
             print("options EOB confirm error:", e)
+    # boards last, so a board moved to the bottom sits below this run's alerts
+    for name, txt in boards.items():
+        try:
+            sent += _post_board(state, name, txt, now, send, edit, delete, moved=name in changed)
+        except Exception as e:
+            print(f"options {name} board: {e}")
     # replies to typed requests
     import re
     for q in asks or []:

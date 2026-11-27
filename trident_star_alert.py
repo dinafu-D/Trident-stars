@@ -293,11 +293,13 @@ OPT_TG_TOKEN = os.getenv("OPT_TELEGRAM_BOT_TOKEN", "")
 OPT_TG_CHAT = os.getenv("OPT_TELEGRAM_CHAT_ID", "") or TG_CHAT
 
 
-def _tg_send(token, chat, text, reply_to=None):
+def _tg_send(token, chat, text, reply_to=None, silent=False):
     if not token or not chat:
         print("[no Telegram secrets] would send:\n" + text)
         return -1
     body = {"chat_id": chat, "text": text, "parse_mode": "HTML"}
+    if silent:
+        body["disable_notification"] = True
     if reply_to and reply_to > 0:
         body["reply_to_message_id"] = reply_to
         body["allow_sending_without_reply"] = True
@@ -312,9 +314,31 @@ def _tg_send(token, chat, text, reply_to=None):
     return r.json()["result"]["message_id"]
 
 
-def send(text, reply_to=None):
+def send(text, reply_to=None, silent=False):
     """Send on the main bot. Returns message id (truthy) or None if it failed."""
-    return _tg_send(TG_TOKEN, TG_CHAT, text, reply_to)
+    return _tg_send(TG_TOKEN, TG_CHAT, text, reply_to, silent)
+
+
+def _tg_del(token, chat, mid):
+    try:
+        r = requests.post(f"https://api.telegram.org/bot{token}/deleteMessage", timeout=20,
+                          json={"chat_id": chat, "message_id": mid})
+        return r.ok
+    except Exception as e:
+        print("Telegram delete error:", str(e).replace(token, "***"))
+        return False
+
+
+def del_main(mid):
+    """Delete a main-bot message (used to move the board to the bottom)."""
+    return bool(TG_TOKEN and mid and mid > 0 and _tg_del(TG_TOKEN, TG_CHAT, mid))
+
+
+def del_opt(mid):
+    """Delete an options-bot message (main bot if it was sent there as fallback)."""
+    if OPT_TG_TOKEN and mid and mid > 0 and _tg_del(OPT_TG_TOKEN, OPT_TG_CHAT, mid):
+        return True
+    return del_main(mid)
 
 
 def opt_asks(state):
@@ -339,14 +363,14 @@ def opt_asks(state):
     return out
 
 
-def send_opt(text, reply_to=None):
+def send_opt(text, reply_to=None, silent=False):
     """Send option messages on the separate options bot; falls back to the main bot if not set up."""
     if OPT_TG_TOKEN:
-        mid = _tg_send(OPT_TG_TOKEN, OPT_TG_CHAT, text, reply_to)
+        mid = _tg_send(OPT_TG_TOKEN, OPT_TG_CHAT, text, reply_to, silent)
         if mid:
             return mid
         print("Options bot failed, sending on main bot instead")
-    return send(text, reply_to)
+    return send(text, reply_to, silent)
 
 
 DELETE_TAKEN = os.getenv("DELETE_TAKEN", "1") == "1"   # delete an alert once its star group is taken
@@ -540,14 +564,16 @@ def main():
             if gone:
                 print(f"{name} {tf}: deleted {gone} alert(s) whose group was taken")
             print(f"{name} {tf}: {len(chart)} candles, {sum(len(g) == 3 for _, _, g in groups)} 3-star, {sum(len(g) == 2 for _, _, g in groups)} 2-star live")
+    main_sent = sent_any                       # main-bot alerts this run -> move the index board to the bottom
     if options_alert and dhan_m5 and dhan_data and dhan_data.enabled():
         try:
-            sent_any += options_alert.run(dhan_m5, state, now, send_opt, dhan_data.fetch_option, edit_opt, opt_asks(state))
+            sent_any += options_alert.run(dhan_m5, state, now, send_opt, dhan_data.fetch_option, edit_opt,
+                                          opt_asks(state), delete=del_opt)
         except Exception as e:
             print(f"options error {e}")
     if conbox_alert:
         try:
-            sent_any += conbox_alert.send_status(state, now, send, edit_msg)
+            sent_any += conbox_alert.send_status(state, now, send, edit_msg, delete=del_main, moved=main_sent > 0)
         except Exception as e:
             print(f"con box status error {e}")
     if data_errors:

@@ -19,7 +19,7 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -65,6 +65,28 @@ jobs:
           ALERT_2STAR: "0"        # 0 = only complete 3-star groups
           FORCE: ${{ github.event.inputs.force || '0' }}
         run: python trident_star_alert.py
+
+      # commodity bot (MCX 09:00-23:55): its own Telegram bot, shares the Dhan login + memory folder
+      - name: Commodity bot
+        if: always()
+        env:
+          COM_TELEGRAM_BOT_TOKEN: ${{ secrets.COM_TELEGRAM_BOT_TOKEN }}
+          COM_TELEGRAM_CHAT_ID: ${{ secrets.COM_TELEGRAM_CHAT_ID }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DHAN_CLIENT_ID: ${{ secrets.DHAN_CLIENT_ID }}
+          DHAN_PIN: ${{ secrets.DHAN_PIN }}
+          DHAN_TOTP_SECRET: ${{ secrets.DHAN_TOTP_SECRET }}
+          COM_NSE: "1"            # also NSE crude oil / natural gas options, if Dhan gives them (0 = off)
+          CONBOX_ALERTS: "1"
+          CB_MIN_BARS: "1"
+          CB_MTF_1H: "1"
+          TREND_CHANGE_ALERTS: "1"
+          CB_OVERLAP: "0"
+          H1_BOX_ALERTS: "1"
+          HLLH_ALERTS: "1"
+          EOB_ALERTS: "1"
+          FORCE: ${{ github.event.inputs.force || '0' }}
+        run: python commodity_alert.py
 
       - name: Save sent-alert memory
         if: always()

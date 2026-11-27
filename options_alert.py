@@ -189,6 +189,13 @@ def _brow(label, s):
     return f"{label:<9}{s['tag']:<8}{s['dur']:<6}{s['st']}"
 
 
+def _al_text(head, rows):
+    """🔔 alert table: Strike / Box / Time / Status (NEW, U, D, RE-IN)"""
+    hdr = f"{'Strike':<9}{'Box':<8}{'Time':<6}Status"
+    return head + "\n<pre>" + "\n".join([hdr] + [f"{r['label']:<9}{r['tag']:<8}{r['dur']:<6}{r['lab']}"
+                                                  for r in rows]) + "</pre>"
+
+
 def _post_board(state, name, txt, now, send, edit):
     bd = state.setdefault("_optboard", {})
     today = pd.Timestamp(now).strftime("%Y-%m-%d")
@@ -369,7 +376,7 @@ def run(m5_by_name, state, now, send, fetch_option, edit=None, asks=None):
     last_st = state.setdefault("_optst", {})
     today = pd.Timestamp(now).strftime("%Y-%m-%d")
     names = [n for n in order_names(now) if n in contracts and n in m5_by_name]
-    cache = {}
+    cache, cur = {}, {}
     for name in names:
         step = CFG[name]["step"]
         m5 = m5_by_name[name]
@@ -413,11 +420,16 @@ def run(m5_by_name, state, now, send, fetch_option, edit=None, asks=None):
                 # alert: a NEW box today, or the status changed to U / D (silent while inside)
                 key = f"{name}|{k}{typ}"
                 prev = last_st.get(key)
+                if st:
+                    cur[key] = st
                 if st and prev and prev.get("day") == today:
+                    row = dict(key=key, label=f"{k}{typ}", firstT=st["firstT"], tag=st["tag"], dur=st["dur"])
                     if st["today"] and st["firstT"] != prev.get("firstT"):
-                        al.append(_brow(f"{k}{typ}", dict(st, st="NEW")))
+                        al.append(dict(row, lab="NEW", active=st["st"] == "In"))          # new box
                     elif st["firstT"] == prev.get("firstT") and st["st"] in ("U", "D") and st["st"] != prev.get("st"):
-                        al.append(_brow(f"{k}{typ}", st))
+                        al.append(dict(row, lab=st["st"], active=False))                # broke up / down
+                    elif st["firstT"] == prev.get("firstT") and st["st"] == "In" and prev.get("st") in ("U", "D"):
+                        al.append(dict(row, lab="RE-IN", active=True))                  # broken box re-entered
                 if st:
                     last_st[key] = dict(day=today, firstT=st["firstT"], st=st["st"])
         arrow = "⬇ PE" if idx_dir == -1 else "⬆ CE" if idx_dir == 1 else "CE + PE"
@@ -429,12 +441,38 @@ def run(m5_by_name, state, now, send, fetch_option, edit=None, asks=None):
         except Exception as e:
             print(f"options {name} board: {e}")
         if al:
-            alerts.append(f"🔔 <b>{name} OPTIONS · {pd.Timestamp(now):%H:%M}</b>\n<pre>" + "\n".join([hdr] + al) + "</pre>")
+            alerts.append((f"🔔 <b>{name} OPTIONS · {pd.Timestamp(now):%H:%M}</b>", al))
         log.append(f"{name} ATM {atm} ({len(al)} alerts)")
     print("options: " + ", ".join(log))
-    for m in alerts:
-        if send(m[:4090]):
+    alst = state.setdefault("_optal", {})
+    for mid in [m for m, v in alst.items() if v.get("day") != today]:
+        alst.pop(mid)
+    just = set()
+    for head, rows in alerts:
+        mid = send(_al_text(head, rows))
+        if mid:
             sent += 1
+            if isinstance(mid, int) and mid > 0 and any(r["active"] for r in rows):
+                alst[str(mid)] = dict(day=today, head=head, rows=rows)
+                just.add(str(mid))
+    # live edit: rows still inside their box get the new Time / Box every 5 min; frozen once they break
+    for mid, v in alst.items():
+        if mid in just:
+            continue
+        old = _al_text(v["head"], v["rows"])
+        for r in v["rows"]:
+            if not r["active"] or r["key"] not in cur:
+                continue
+            c = cur[r["key"]]
+            if c["firstT"] == r["firstT"] and c["st"] == "In":
+                r.update(tag=c["tag"], dur=c["dur"])
+            else:
+                r["active"] = False
+        txt = _al_text(v["head"], v["rows"])
+        if txt != old and edit:
+            edit(int(mid), txt)
+    for mid in [m for m, v in alst.items() if not any(r["active"] for r in v["rows"])]:
+        alst.pop(mid)
     if EOBC_ON:
         try:
             sent += run_eob_confirm(found, idxinfo, state, now, send, edit, names)

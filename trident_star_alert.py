@@ -485,7 +485,7 @@ def main():
             dhan_m5[name] = m5
         if conbox_alert:
             try:
-                sent_any += conbox_alert.run(name, m5, state, now, send)
+                sent_any += conbox_alert.run(name, m5, state, now, send, edit_msg)
             except Exception as e:
                 print(f"{name}: con box error {e}")
         if eob_alert:

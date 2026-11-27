@@ -43,11 +43,14 @@ def _ms(ts):
     return int(pd.Timestamp(ts).value // 1_000_000)
 
 
+SESS_END = (15, 30)    # session end (MCX: 23:55, set by the commodity bot)
+
+
 def _closed_1h(h1, now):
     """Closed 1h candles only (last candle of the day 15:15-15:30)."""
     keep = []
     for x in h1.index:
-        end = min(x + pd.Timedelta(hours=1), x.normalize() + pd.Timedelta(hours=15, minutes=30))
+        end = min(x + pd.Timedelta(hours=1), x.normalize() + pd.Timedelta(hours=SESS_END[0], minutes=SESS_END[1]))
         keep.append(end <= now)
     return h1[keep]
 

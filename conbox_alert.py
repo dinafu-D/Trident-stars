@@ -41,6 +41,8 @@ TICK = {"NIFTY": 0.05, "SENSEX": 0.01}
 
 LAST = {}          # last replay: boxes + closes (for the status message)
 STATUS = {}        # per index: (signature, text) for the combined status message
+SESS_START = (9, 15)   # session start (h, m): NSE/BSE 09:15 | MCX 09:00 (set by the commodity bot)
+SESS_END = (15, 30)    # session end   (h, m): NSE/BSE 15:30 | MCX 23:55
 MTF = {}           # per index: current 1h MTF box line (short)
 HBOX = {}          # per index: 1h MTF boxes (firstT, hi, lo) for the 5m+1h tag
 STATUS_ON = os.getenv("CB_STATUS", "1") == "1"
@@ -106,7 +108,7 @@ def replay(m5, tick, tf_min=TF_MIN):
     end = [x + tf_min * 60000 for x in t]
     H, L, C = list(m5["High"]), list(m5["Low"]), list(m5["Close"])
     n = len(C)
-    dayEnd = [_ms(pd.Timestamp(x).normalize() + pd.Timedelta(hours=15, minutes=30)) for x in m5.index]
+    dayEnd = [_ms(pd.Timestamp(x).normalize() + pd.Timedelta(hours=SESS_END[0], minutes=SESS_END[1])) for x in m5.index]
     atr = _atr(H, L, C, ATR_LEN)
     ema = _ema(C, EMA_LEN)
     tolT, tolP = 1 * tf_min * 60000, tick
@@ -380,12 +382,12 @@ def hourly(m5, now):
     df = m5[[(_ms(x) + TF_MIN * 60000) <= _ms(now) for x in m5.index]]
     starts = []
     for x in df.index:
-        base = x.normalize() + pd.Timedelta(hours=9, minutes=15)
+        base = x.normalize() + pd.Timedelta(hours=SESS_START[0], minutes=SESS_START[1])
         starts.append(base + pd.Timedelta(hours=int((x - base) // pd.Timedelta(hours=1))))
     g = df.groupby(starts)
     h = pd.DataFrame({"Open": g["Open"].first() if "Open" in df else g["Close"].first(),
                       "High": g["High"].max(), "Low": g["Low"].min(), "Close": g["Close"].last()})
-    ends = [min(x + pd.Timedelta(hours=1), x.normalize() + pd.Timedelta(hours=15, minutes=30)) for x in h.index]
+    ends = [min(x + pd.Timedelta(hours=1), x.normalize() + pd.Timedelta(hours=SESS_END[0], minutes=SESS_END[1])) for x in h.index]
     return h[[e <= pd.Timestamp(now) for e in ends]]
 
 
@@ -422,7 +424,7 @@ def mtf_status(m5, now, tick):
     brk_t = None
     if 0 <= bi < len(ht):                                   # close time of the 1h candle (last one ends 15:30)
         st = pd.Timestamp(ht[bi], unit="ms", tz=IST)
-        brk_t = _ms(min(st + pd.Timedelta(hours=1), st.normalize() + pd.Timedelta(hours=15, minutes=30)))
+        brk_t = _ms(min(st + pd.Timedelta(hours=1), st.normalize() + pd.Timedelta(hours=SESS_END[0], minutes=SESS_END[1])))
     return dict(hi=hi, lo=lo, firstT=r["firstT"], live=r["live"], brk=r["brk"], side=side, x=x,
                 dur=_dur(r, 60), brk_t=brk_t, close=c)
 
@@ -555,6 +557,8 @@ def message(name, ev, tag="5m"):
     st = {"F": "NEW", "U": "U", "D": "D", "B": "B", "R": "In"}[ev["kind"]]
     if ev.get("edited"):
         st = "In"
+    if ev["kind"] == "R" and ev.get("rside"):
+        st = f"In ({ev['rside']})"
     title = {"F": "NEW BOX", "R": "RE-IN"}.get(ev["kind"], "BREAK")
     head = f"🔔 <b>{name} 5m · {title} · {when}</b>" + (f" · upd {ev['upd']}" if ev.get("upd") else "")
     rows = [f"{'Box':<8}{'Time':<6}{'Status':<8}Trend", f"{tag:<8}{b['dur']:<6}{st:<8}{_tr_word(tr.get('st', tr['dir']))}"]
@@ -674,12 +678,12 @@ def _lifecycle(name, state, now, send, edit, new_mids):
     else:
         prev = lc["st"]
         if prev in ("U", "D") and st == "In":                       # broken box re-entered
-            ev = dict(kind="R", box=box, trend=tr, end=endnow, close=c)
+            ev = dict(kind="R", box=box, trend=tr, end=endnow, close=c, rside=prev)
             txt = message(name, ev, tag)
             mid = send(txt)
             if mid:
                 sent += 1
-                lc.update(rein=True, mid=mid, kind="R", end=endnow, text=txt)
+                lc.update(rein=True, mid=mid, kind="R", end=endnow, text=txt, rside=prev)
                 lc["st"] = st
                 lcs[name] = lc
                 return sent
@@ -693,7 +697,7 @@ def _lifecycle(name, state, now, send, edit, new_mids):
     # live edit of the NEW / RE-IN alert while inside; freeze once it breaks
     if lc.get("mid") and isinstance(lc["mid"], int) and lc["mid"] > 0:
         if st == "In":
-            ev = dict(kind=lc["kind"], box=box, trend=tr, end=lc["end"], close=c, edited=True,
+            ev = dict(kind=lc["kind"], box=box, trend=tr, end=lc["end"], close=c, edited=True, rside=lc.get("rside"),
                       upd=pd.Timestamp(endnow - TF_MIN * 60000, unit="ms", tz=IST).strftime("%H:%M"))
             txt = message(name, ev, tag)
             if txt != lc.get("text") and edit and edit(lc["mid"], txt):
@@ -723,7 +727,7 @@ def h1_transitions(prev, st):
     if s5 in ("U", "D") and prev["s5"] != s5:
         ev.append("5m" + s5)
     elif s5 == "In" and prev["s5"] in ("U", "D"):
-        ev.append("RE-IN")
+        ev.append("RE-IN " + prev["s5"])                    # side it had broken before coming back
     if conf and not cur["conf"] and s5 == ("U" if conf == 1 else "D"):
         ev.append("1h" + s5)
         cur["conf"] = conf
@@ -757,7 +761,7 @@ def _h1_alerts(name, closed, state, now, send):
             mid = send(f"✅ <b>{name} 1h BOX · 1h CONFIRMED · {bt}</b>\n<pre>" + "\n".join(rows) + "</pre>",
                        reply_to=cur.get("mid"))
         else:
-            rows = [f"{'Box':<6}{'Time':<6}Status", f"{'1h':<6}{st['dur']:<6}In"]
+            rows = [f"{'Box':<6}{'Time':<6}Status", f"{'1h':<6}{st['dur']:<6}In ({e[-1]})"]
             mid = send(f"🔔 <b>{name} 1h BOX · RE-IN · {when}</b>\n<pre>" + "\n".join(rows) + "</pre>")
             cur["mid"] = None
         sent += 1 if mid else 0

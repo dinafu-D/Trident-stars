@@ -437,16 +437,18 @@ def mtf_boxes(m5, now, tick):
     saved = dict(LAST)
     try:
         replay(h, tick, tf_min=60)
-        return [(r["firstT"], r["hi"], r["lo"]) for r in LAST["recs"] if not r["dead"]]
+        return [(r["firstT"], r["hi"], r["lo"], r["rightT"], r["live"]) for r in LAST["recs"] if not r["dead"]]
     finally:
         LAST.clear()
         LAST.update(saved)
 
 
 def box_tag(b, hboxes):
-    """'5m+1h' when the 5m box lies inside a 1h box that started before it, else '5m'."""
-    for ft, hi, lo in hboxes:
-        if ft <= b["firstT"] and lo <= b["lo"] and b["hi"] <= hi:
+    """'5m+1h' when the 5m box lies inside a 1h box that started before it and was still running then, else '5m'."""
+    for hb in hboxes:
+        ft, hi, lo = hb[0], hb[1], hb[2]
+        running = len(hb) < 5 or hb[4] or hb[3] >= b["firstT"]       # 1h box still running when the 5m box formed
+        if running and ft <= b["firstT"] and lo <= b["lo"] and b["hi"] <= hi:
             return "5m+1h"
     return "5m"
 
